@@ -242,16 +242,16 @@ function findAndConvertFiles(
         const allFiles = getAllFiles(dir);
         log(`Found ${allFiles.length} total files`);
 
-        // Filter for downloaded media files (not already in target format)
+        // Filter for downloaded media files - get all supported formats
         const supportedExts = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'mp3', 'm4a', 'wav', 'flac', 'aac', 'opus', 'ogg'];
         
         const filesToConvert = allFiles.filter(file => {
             const ext = path.extname(file).toLowerCase().slice(1);
-            // Don't convert if already in target container format
-            return ext && ext !== data.container && supportedExts.includes(ext);
+            // Convert any supported format if codecs need to be changed
+            return ext && supportedExts.includes(ext);
         });
 
-        log(`Found ${filesToConvert.length} file(s) to convert to ${data.container}`);
+        log(`Found ${filesToConvert.length} file(s) to convert with new codecs`);
 
         if (filesToConvert.length === 0) {
             log("No files to convert found.");
@@ -268,7 +268,7 @@ function findAndConvertFiles(
             const dirPath = path.dirname(fullPath);
             const outputFile = path.join(
                 dirPath,
-                `${fileNameWithoutExt}.${data.container}`
+                `${fileNameWithoutExt}_converted.${data.container}`
             );
 
             log(`[${index + 1}/${filesToConvert.length}] Converting: ${fileName}`);
@@ -278,7 +278,7 @@ function findAndConvertFiles(
                 "-i", fullPath,
             ];
 
-            // Add video codec if specified
+            // Add video codec if specified and not in audio mode
             if (data.mode !== "audio" && vEncoder) {
                 ffmpegArgs.push("-c:v", vEncoder);
             } else if (data.mode === "audio") {
@@ -312,13 +312,23 @@ function findAndConvertFiles(
             ffmpegProcess.on("close", (code) => {
                 if (code === 0) {
                     log(`✓ Successfully converted: ${fileName}`);
+                    
                     // Delete original file
                     try {
                         fs.unlinkSync(fullPath);
                         log(`✓ Deleted original file: ${fileName}`);
+                        
+                        // Rename converted file to remove "_converted" suffix
+                        const finalOutputFile = path.join(
+                            dirPath,
+                            `${fileNameWithoutExt}.${data.container}`
+                        );
+                        fs.renameSync(outputFile, finalOutputFile);
+                        log(`✓ Finalized: ${fileNameWithoutExt}.${data.container}`);
+                        
                         converted++;
                     } catch (err) {
-                        log(`⚠ Warning: Could not delete original file: ${fileName}`);
+                        log(`⚠ Warning: Could not clean up files: ${err}`);
                         converted++;
                     }
                 } else {
