@@ -225,16 +225,25 @@ function findAndConvertFiles(
 
         // Get all files recursively
         function getAllFiles(dirPath: string, arrayOfFiles: string[] = []): string[] {
-            const files = fs.readdirSync(dirPath);
+            try {
+                const files = fs.readdirSync(dirPath);
 
-            files.forEach((file) => {
-                const filePath = path.join(dirPath, file);
-                if (fs.statSync(filePath).isDirectory()) {
-                    arrayOfFiles = getAllFiles(filePath, arrayOfFiles);
-                } else {
-                    arrayOfFiles.push(filePath);
-                }
-            });
+                files.forEach((file) => {
+                    try {
+                        const filePath = path.join(dirPath, file);
+                        const stat = fs.statSync(filePath);
+                        if (stat.isDirectory()) {
+                            arrayOfFiles = getAllFiles(filePath, arrayOfFiles);
+                        } else {
+                            arrayOfFiles.push(filePath);
+                        }
+                    } catch (err) {
+                        // Skip files we can't access
+                    }
+                });
+            } catch (err) {
+                // Skip directories we can't access
+            }
 
             return arrayOfFiles;
         }
@@ -242,19 +251,32 @@ function findAndConvertFiles(
         const allFiles = getAllFiles(dir);
         log(`Found ${allFiles.length} total files`);
 
-        // Filter for downloaded media files - get all supported formats
-        const supportedExts = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'mp3', 'm4a', 'wav', 'flac', 'aac', 'opus', 'ogg'];
+        // Filter for supported media files
+        const supportedExts = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'mp3', 'm4a', 'wav', 'flac', 'aac', 'opus', 'ogg', '3gp', 'wmv', 'f4v'];
         
         const filesToConvert = allFiles.filter(file => {
             const ext = path.extname(file).toLowerCase().slice(1);
-            // Convert any supported format if codecs need to be changed
             return ext && supportedExts.includes(ext);
         });
 
-        log(`Found ${filesToConvert.length} file(s) to convert with new codecs`);
+        log(`Found ${filesToConvert.length} supported media file(s)`);
+
+        // Show first few files for debugging
+        if (filesToConvert.length > 0) {
+            log(`First files found: ${filesToConvert.slice(0, 3).map(f => path.basename(f)).join(", ")}`);
+        }
 
         if (filesToConvert.length === 0) {
-            log("No files to convert found.");
+            log("No supported media files to convert found.");
+            log("Looking for any downloadable files in the directory...");
+            
+            // Show sample of what files ARE in the directory
+            const sampleFiles = allFiles
+                .slice(0, 10)
+                .map(f => `${path.basename(f)} (${path.extname(f)})`)
+                .join("\n");
+            
+            log(`Sample files in directory:\n${sampleFiles}`);
             resolve(true);
             return;
         }
