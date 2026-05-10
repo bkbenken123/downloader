@@ -221,38 +221,57 @@ function findAndConvertFiles(
     resolve: (value: boolean) => void
 ) {
     try {
-        const files = fs.readdirSync(dir, { recursive: true }) as string[];
+        log(`Scanning directory: ${dir}`);
 
-        let converted = 0;
-        let totalFiles = 0;
+        // Get all files recursively
+        function getAllFiles(dirPath: string, arrayOfFiles: string[] = []): string[] {
+            const files = fs.readdirSync(dirPath);
+
+            files.forEach((file) => {
+                const filePath = path.join(dirPath, file);
+                if (fs.statSync(filePath).isDirectory()) {
+                    arrayOfFiles = getAllFiles(filePath, arrayOfFiles);
+                } else {
+                    arrayOfFiles.push(filePath);
+                }
+            });
+
+            return arrayOfFiles;
+        }
+
+        const allFiles = getAllFiles(dir);
+        log(`Found ${allFiles.length} total files`);
 
         // Filter for downloaded media files (not already in target format)
-        const filesToConvert = files.filter(file => {
+        const supportedExts = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'mp3', 'm4a', 'wav', 'flac', 'aac', 'opus', 'ogg'];
+        
+        const filesToConvert = allFiles.filter(file => {
             const ext = path.extname(file).toLowerCase().slice(1);
-            return ext && ext !== data.container && 
-                   ['mp4', 'mkv', 'webm', 'mov', 'mp3', 'm4a', 'wav', 'flac', 'webm', 'avi', 'mov'].includes(ext);
+            // Don't convert if already in target container format
+            return ext && ext !== data.container && supportedExts.includes(ext);
         });
 
-        totalFiles = filesToConvert.length;
+        log(`Found ${filesToConvert.length} file(s) to convert to ${data.container}`);
 
-        if (totalFiles === 0) {
+        if (filesToConvert.length === 0) {
             log("No files to convert found.");
             resolve(true);
             return;
         }
 
-        log(`Found ${totalFiles} file(s) to convert`);
+        let converted = 0;
+        let failed = 0;
 
-        filesToConvert.forEach((file, index) => {
-            const fullPath = path.join(dir, file);
-            const fileName = path.basename(file);
-            const fileNameWithoutExt = path.parse(file).name;
+        filesToConvert.forEach((fullPath, index) => {
+            const fileName = path.basename(fullPath);
+            const fileNameWithoutExt = path.parse(fullPath).name;
+            const dirPath = path.dirname(fullPath);
             const outputFile = path.join(
-                path.dirname(fullPath),
+                dirPath,
                 `${fileNameWithoutExt}.${data.container}`
             );
 
-            log(`Converting file ${index + 1}/${totalFiles}: ${fileName}`);
+            log(`[${index + 1}/${filesToConvert.length}] Converting: ${fileName}`);
 
             // Build ffmpeg conversion command
             const ffmpegArgs = [
@@ -262,6 +281,9 @@ function findAndConvertFiles(
             // Add video codec if specified
             if (data.mode !== "audio" && vEncoder) {
                 ffmpegArgs.push("-c:v", vEncoder);
+            } else if (data.mode === "audio") {
+                // Skip video for audio mode
+                ffmpegArgs.push("-vn");
             }
 
             // Add audio codec if specified
@@ -274,31 +296,43 @@ function findAndConvertFiles(
             const ffmpegProcess = spawn(ffmpegPath, ffmpegArgs);
 
             ffmpegProcess.stdout.on("data", (d) => {
-                log(d.toString());
+                const output = d.toString().trim();
+                if (output) {
+                    log(`[FFMPEG] ${output}`);
+                }
             });
 
             ffmpegProcess.stderr.on("data", (d) => {
-                log(d.toString());
+                const output = d.toString().trim();
+                if (output) {
+                    log(`[FFMPEG] ${output}`);
+                }
             });
 
             ffmpegProcess.on("close", (code) => {
                 if (code === 0) {
-                    log(`Successfully converted: ${fileName}`);
+                    log(`✓ Successfully converted: ${fileName}`);
                     // Delete original file
                     try {
                         fs.unlinkSync(fullPath);
-                        log(`Deleted original file: ${fileName}`);
+                        log(`✓ Deleted original file: ${fileName}`);
+                        converted++;
                     } catch (err) {
-                        log(`Warning: Could not delete original file: ${fileName}`);
+                        log(`⚠ Warning: Could not delete original file: ${fileName}`);
+                        converted++;
                     }
-                    converted++;
                 } else {
-                    log(`Error converting ${fileName}: FFmpeg exited with code ${code}`);
+                    log(`✗ Error converting ${fileName}: FFmpeg exited with code ${code}`);
+                    failed++;
                 }
 
-                // If all files are done, resolve
-                if (converted + (totalFiles - converted - 1) === totalFiles - 1) {
-                    log(`Conversion complete. Successfully converted ${converted}/${totalFiles} files`);
+                // Check if all conversions are done
+                if (converted + failed === filesToConvert.length) {
+                    log(`\n=== Conversion Summary ===`);
+                    log(`Successfully converted: ${converted}/${filesToConvert.length}`);
+                    if (failed > 0) {
+                        log(`Failed: ${failed}/${filesToConvert.length}`);
+                    }
                     resolve(true);
                 }
             });
