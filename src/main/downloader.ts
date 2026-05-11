@@ -90,6 +90,7 @@ export async function startDownload(
         }
 
         let outputTemplate = "";
+        let playlistName = "";
 
         if (isPlaylist(data.url)) {
             outputTemplate = path.join(
@@ -194,6 +195,13 @@ export async function startDownload(
                 log(`[INFO] Detected merged file: ${mergedFile}`);
             }
 
+            // Extract playlist name from download finished message
+            const playlistMatch = output.match(/\[download\]\s+Finished downloading playlist:\s+(.+)/i);
+            if (playlistMatch && playlistMatch[1]) {
+                playlistName = playlistMatch[1].trim();
+                log(`[INFO] Detected playlist: ${playlistName}`);
+            }
+
             // Also capture regular download destinations
             const destMatch = output.match(/\[download\]\s+Destination:\s+(.+)/i);
             if (destMatch && destMatch[1]) {
@@ -229,10 +237,30 @@ export async function startDownload(
 
             log("Starting ffmpeg conversion...");
 
+            // For playlists, construct the directory path and find files
+            if (isPlaylist(data.url) && playlistName) {
+                const playlistDir = path.join(downloadsDir, playlistName);
+                
+                if (fs.existsSync(playlistDir)) {
+                    log(`[INFO] Scanning playlist directory: ${playlistDir}`);
+                    
+                    convertPlaylistFiles(
+                        playlistDir,
+                        data,
+                        vEncoder,
+                        aEncoder,
+                        ffmpeg,
+                        log,
+                        resolve
+                    );
+                    return;
+                }
+            }
+
             // Use merged file if available, otherwise use the last downloaded file
             let fileToConvert = mergedFile || downloadedFile;
 
-            // If still no file, try constructing it from the template
+            // If still no file, try using the first detected file
             if (!fileToConvert && allDownloadedFiles.length > 0) {
                 fileToConvert = allDownloadedFiles[allDownloadedFiles.length - 1];
                 log(`[INFO] Using file: ${fileToConvert}`);
@@ -255,6 +283,72 @@ export async function startDownload(
             );
         });
     });
+}
+
+function convertPlaylistFiles(
+    playlistDir: string,
+    data: DownloadRequest,
+    vEncoder: string | null,
+    aEncoder: string | null,
+    ffmpegPath: string,
+    log: (msg: string) => void,
+    resolve: (value: boolean) => void
+) {
+    try {
+        const files = fs.readdirSync(playlistDir);
+        const supportedExts = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'mp3', 'm4a', 'wav', 'flac', 'aac', 'opus', 'ogg'];
+        
+        const mediaFiles = files.filter(file => {
+            const ext = path.extname(file).toLowerCase().slice(1);
+            return ext && supportedExts.includes(ext);
+        });
+
+        log(`Found ${mediaFiles.length} media file(s) in playlist`);
+
+        if (mediaFiles.length === 0) {
+            log("No media files to convert in playlist");
+            resolve(true);
+            return;
+        }
+
+        let converted = 0;
+        let failed = 0;
+
+        mediaFiles.forEach((fileName, index) => {
+            const fullPath = path.join(playlistDir, fileName);
+            
+            log(`[${index + 1}/${mediaFiles.length}] Converting: ${fileName}`);
+
+            convertFile(
+                fullPath,
+                data,
+                vEncoder,
+                aEncoder,
+                ffmpegPath,
+                log,
+                (success) => {
+                    if (success) {
+                        converted++;
+                    } else {
+                        failed++;
+                    }
+
+                    // If all files are done, resolve
+                    if (converted + failed === mediaFiles.length) {
+                        log(`\n=== Playlist Conversion Summary ===`);
+                        log(`Successfully converted: ${converted}/${mediaFiles.length}`);
+                        if (failed > 0) {
+                            log(`Failed: ${failed}/${mediaFiles.length}`);
+                        }
+                        resolve(true);
+                    }
+                }
+            );
+        });
+    } catch (err) {
+        log(`Error scanning playlist directory: ${err}`);
+        resolve(false);
+    }
 }
 
 function convertFile(
@@ -341,7 +435,6 @@ function convertFile(
                     log(`⚠ Warning: Could not clean up files: ${err}`);
                 }
                 
-                log(`\n=== Conversion Complete ===`);
                 resolve(true);
             } else {
                 log(`✗ Error converting ${fileName}: FFmpeg exited with code ${code}`);
