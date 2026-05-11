@@ -114,30 +114,51 @@ function findAndConvertFiles(dir, data, vEncoder, aEncoder, ffmpegPath, log, res
         log(`Scanning directory: ${dir}`);
         // Get all files recursively
         function getAllFiles(dirPath, arrayOfFiles = []) {
-            const files = fs_1.default.readdirSync(dirPath);
-            files.forEach((file) => {
-                const filePath = path_1.default.join(dirPath, file);
-                if (fs_1.default.statSync(filePath).isDirectory()) {
-                    arrayOfFiles = getAllFiles(filePath, arrayOfFiles);
-                }
-                else {
-                    arrayOfFiles.push(filePath);
-                }
-            });
+            try {
+                const files = fs_1.default.readdirSync(dirPath);
+                files.forEach((file) => {
+                    try {
+                        const filePath = path_1.default.join(dirPath, file);
+                        const stat = fs_1.default.statSync(filePath);
+                        if (stat.isDirectory()) {
+                            arrayOfFiles = getAllFiles(filePath, arrayOfFiles);
+                        }
+                        else {
+                            arrayOfFiles.push(filePath);
+                        }
+                    }
+                    catch (err) {
+                        // Skip files we can't access
+                    }
+                });
+            }
+            catch (err) {
+                // Skip directories we can't access
+            }
             return arrayOfFiles;
         }
         const allFiles = getAllFiles(dir);
         log(`Found ${allFiles.length} total files`);
-        // Filter for downloaded media files (not already in target format)
-        const supportedExts = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'mp3', 'm4a', 'wav', 'flac', 'aac', 'opus', 'ogg'];
+        // Filter for supported media files
+        const supportedExts = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'mp3', 'm4a', 'wav', 'flac', 'aac', 'opus', 'ogg', '3gp', 'wmv', 'f4v'];
         const filesToConvert = allFiles.filter(file => {
             const ext = path_1.default.extname(file).toLowerCase().slice(1);
-            // Don't convert if already in target container format
-            return ext && ext !== data.container && supportedExts.includes(ext);
+            return ext && supportedExts.includes(ext);
         });
-        log(`Found ${filesToConvert.length} file(s) to convert to ${data.container}`);
+        log(`Found ${filesToConvert.length} supported media file(s)`);
+        // Show first few files for debugging
+        if (filesToConvert.length > 0) {
+            log(`First files found: ${filesToConvert.slice(0, 3).map(f => path_1.default.basename(f)).join(", ")}`);
+        }
         if (filesToConvert.length === 0) {
-            log("No files to convert found.");
+            log("No supported media files to convert found.");
+            log("Looking for any downloadable files in the directory...");
+            // Show sample of what files ARE in the directory
+            const sampleFiles = allFiles
+                .slice(0, 10)
+                .map(f => `${path_1.default.basename(f)} (${path_1.default.extname(f)})`)
+                .join("\n");
+            log(`Sample files in directory:\n${sampleFiles}`);
             resolve(true);
             return;
         }
@@ -147,13 +168,13 @@ function findAndConvertFiles(dir, data, vEncoder, aEncoder, ffmpegPath, log, res
             const fileName = path_1.default.basename(fullPath);
             const fileNameWithoutExt = path_1.default.parse(fullPath).name;
             const dirPath = path_1.default.dirname(fullPath);
-            const outputFile = path_1.default.join(dirPath, `${fileNameWithoutExt}.${data.container}`);
+            const outputFile = path_1.default.join(dirPath, `${fileNameWithoutExt}_converted.${data.container}`);
             log(`[${index + 1}/${filesToConvert.length}] Converting: ${fileName}`);
             // Build ffmpeg conversion command
             const ffmpegArgs = [
                 "-i", fullPath,
             ];
-            // Add video codec if specified
+            // Add video codec if specified and not in audio mode
             if (data.mode !== "audio" && vEncoder) {
                 ffmpegArgs.push("-c:v", vEncoder);
             }
@@ -186,10 +207,14 @@ function findAndConvertFiles(dir, data, vEncoder, aEncoder, ffmpegPath, log, res
                     try {
                         fs_1.default.unlinkSync(fullPath);
                         log(`✓ Deleted original file: ${fileName}`);
+                        // Rename converted file to remove "_converted" suffix
+                        const finalOutputFile = path_1.default.join(dirPath, `${fileNameWithoutExt}.${data.container}`);
+                        fs_1.default.renameSync(outputFile, finalOutputFile);
+                        log(`✓ Finalized: ${fileNameWithoutExt}.${data.container}`);
                         converted++;
                     }
                     catch (err) {
-                        log(`⚠ Warning: Could not delete original file: ${fileName}`);
+                        log(`⚠ Warning: Could not clean up files: ${err}`);
                         converted++;
                     }
                 }
