@@ -108,7 +108,7 @@ async function startDownload(data, log) {
             const destMatch = output.match(/\[download\]\s+Destination:\s+(.+)/i);
             if (destMatch && destMatch[1]) {
                 downloadedFile = destMatch[1].trim();
-                if (!allDownloadedFiles.includes(downloadedFile)) {
+                if (downloadedFile && !allDownloadedFiles.includes(downloadedFile)) {
                     allDownloadedFiles.push(downloadedFile);
                 }
                 log(`[INFO] Detected file: ${downloadedFile}`);
