@@ -177,7 +177,8 @@ export async function startDownload(
         log(args.join(" "));
 
         let downloadedFile: string | null = null;
-        let playlistName: string | null = null;
+        let mergedFile: string | null = null;
+        const allDownloadedFiles: string[] = [];
 
         const yt = spawn(ytdlp, args);
 
@@ -185,21 +186,30 @@ export async function startDownload(
             const output = d.toString();
             log(output);
 
-            // Try to extract filename from yt-dlp output
-            // Look for patterns like "[download] Destination: filename.ext"
+            // Try to extract the final merged file from [Merger] line
+            // Pattern: [Merger] Merging formats into "path/to/file.ext"
+            const mergerMatch = output.match(/\[Merger\]\s+Merging formats into\s+"([^"]+)"/i);
+            if (mergerMatch && mergerMatch[1]) {
+                mergedFile = mergerMatch[1].trim();
+                log(`[INFO] Detected merged file: ${mergedFile}`);
+            }
+
+            // Also capture regular download destinations
             const destMatch = output.match(/\[download\]\s+Destination:\s+(.+)/i);
             if (destMatch && destMatch[1]) {
                 downloadedFile = destMatch[1].trim();
+                if (!allDownloadedFiles.includes(downloadedFile)) {
+                    allDownloadedFiles.push(downloadedFile);
+                }
                 log(`[INFO] Detected file: ${downloadedFile}`);
             }
 
-            // Try to extract playlist name
-            const playlistMatch = output.match(/\[info\]\s+Writing playlist metadata/i);
-            if (playlistMatch && isPlaylist(data.url)) {
-                const playlistInfoMatch = output.match(/Downloading playlist:\s+(.+)/i);
-                if (playlistInfoMatch && playlistInfoMatch[1]) {
-                    playlistName = playlistInfoMatch[1].trim();
-                    log(`[INFO] Detected playlist: ${playlistName}`);
+            // Capture individual file downloads
+            const fileMatch = output.match(/\[download\]\s+\d+\.\d+%.*?to\s+"([^"]+)"/i);
+            if (fileMatch && fileMatch[1]) {
+                const file = fileMatch[1].trim();
+                if (!allDownloadedFiles.includes(file)) {
+                    allDownloadedFiles.push(file);
                 }
             }
         });
@@ -219,16 +229,23 @@ export async function startDownload(
 
             log("Starting ffmpeg conversion...");
 
-            // If we didn't capture filename, construct it from template
-            if (!downloadedFile) {
-                // This is a fallback - ideally we capture it from yt-dlp output
-                log("[WARNING] Could not detect exact filename from yt-dlp output");
+            // Use merged file if available, otherwise use the last downloaded file
+            let fileToConvert = mergedFile || downloadedFile;
+
+            // If still no file, try constructing it from the template
+            if (!fileToConvert && allDownloadedFiles.length > 0) {
+                fileToConvert = allDownloadedFiles[allDownloadedFiles.length - 1];
+                log(`[INFO] Using file: ${fileToConvert}`);
+            }
+
+            if (!fileToConvert) {
+                log("[WARNING] Could not detect downloaded file from yt-dlp output");
                 resolve(true);
                 return;
             }
 
             convertFile(
-                downloadedFile,
+                fileToConvert,
                 data,
                 vEncoder,
                 aEncoder,
