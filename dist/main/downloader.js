@@ -90,9 +90,28 @@ async function startDownload(data, log) {
         args.push(data.url);
         log("Starting yt-dlp...");
         log(args.join(" "));
+        let downloadedFile = null;
+        let playlistName = null;
         const yt = (0, child_process_1.spawn)(ytdlp, args);
         yt.stdout.on("data", d => {
-            log(d.toString());
+            const output = d.toString();
+            log(output);
+            // Try to extract filename from yt-dlp output
+            // Look for patterns like "[download] Destination: filename.ext"
+            const destMatch = output.match(/\[download\]\s+Destination:\s+(.+)/i);
+            if (destMatch && destMatch[1]) {
+                downloadedFile = destMatch[1].trim();
+                log(`[INFO] Detected file: ${downloadedFile}`);
+            }
+            // Try to extract playlist name
+            const playlistMatch = output.match(/\[info\]\s+Writing playlist metadata/i);
+            if (playlistMatch && isPlaylist(data.url)) {
+                const playlistInfoMatch = output.match(/Downloading playlist:\s+(.+)/i);
+                if (playlistInfoMatch && playlistInfoMatch[1]) {
+                    playlistName = playlistInfoMatch[1].trim();
+                    log(`[INFO] Detected playlist: ${playlistName}`);
+                }
+            }
         });
         yt.stderr.on("data", d => {
             log(d.toString());
@@ -104,134 +123,82 @@ async function startDownload(data, log) {
                 return;
             }
             log("Starting ffmpeg conversion...");
-            // Find downloaded files and convert them
-            findAndConvertFiles(downloadsDir, data, vEncoder, aEncoder, ffmpeg, log, resolve);
+            // If we didn't capture filename, construct it from template
+            if (!downloadedFile) {
+                // This is a fallback - ideally we capture it from yt-dlp output
+                log("[WARNING] Could not detect exact filename from yt-dlp output");
+                resolve(true);
+                return;
+            }
+            convertFile(downloadedFile, data, vEncoder, aEncoder, ffmpeg, log, resolve);
         });
     });
 }
-function findAndConvertFiles(dir, data, vEncoder, aEncoder, ffmpegPath, log, resolve) {
+function convertFile(filePath, data, vEncoder, aEncoder, ffmpegPath, log, resolve) {
     try {
-        log(`Scanning directory: ${dir}`);
-        // Get all files recursively
-        function getAllFiles(dirPath, arrayOfFiles = []) {
-            try {
-                const files = fs_1.default.readdirSync(dirPath);
-                files.forEach((file) => {
-                    try {
-                        const filePath = path_1.default.join(dirPath, file);
-                        const stat = fs_1.default.statSync(filePath);
-                        if (stat.isDirectory()) {
-                            arrayOfFiles = getAllFiles(filePath, arrayOfFiles);
-                        }
-                        else {
-                            arrayOfFiles.push(filePath);
-                        }
-                    }
-                    catch (err) {
-                        // Skip files we can't access
-                    }
-                });
-            }
-            catch (err) {
-                // Skip directories we can't access
-            }
-            return arrayOfFiles;
-        }
-        const allFiles = getAllFiles(dir);
-        log(`Found ${allFiles.length} total files`);
-        // Filter for supported media files
-        const supportedExts = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'mp3', 'm4a', 'wav', 'flac', 'aac', 'opus', 'ogg', '3gp', 'wmv', 'f4v'];
-        const filesToConvert = allFiles.filter(file => {
-            const ext = path_1.default.extname(file).toLowerCase().slice(1);
-            return ext && supportedExts.includes(ext);
-        });
-        log(`Found ${filesToConvert.length} supported media file(s)`);
-        // Show first few files for debugging
-        if (filesToConvert.length > 0) {
-            log(`First files found: ${filesToConvert.slice(0, 3).map(f => path_1.default.basename(f)).join(", ")}`);
-        }
-        if (filesToConvert.length === 0) {
-            log("No supported media files to convert found.");
-            log("Looking for any downloadable files in the directory...");
-            // Show sample of what files ARE in the directory
-            const sampleFiles = allFiles
-                .slice(0, 10)
-                .map(f => `${path_1.default.basename(f)} (${path_1.default.extname(f)})`)
-                .join("\n");
-            log(`Sample files in directory:\n${sampleFiles}`);
-            resolve(true);
+        // Check if file exists
+        if (!fs_1.default.existsSync(filePath)) {
+            log(`✗ File not found: ${filePath}`);
+            resolve(false);
             return;
         }
-        let converted = 0;
-        let failed = 0;
-        filesToConvert.forEach((fullPath, index) => {
-            const fileName = path_1.default.basename(fullPath);
-            const fileNameWithoutExt = path_1.default.parse(fullPath).name;
-            const dirPath = path_1.default.dirname(fullPath);
-            const outputFile = path_1.default.join(dirPath, `${fileNameWithoutExt}_converted.${data.container}`);
-            log(`[${index + 1}/${filesToConvert.length}] Converting: ${fileName}`);
-            // Build ffmpeg conversion command
-            const ffmpegArgs = [
-                "-i", fullPath,
-            ];
-            // Add video codec if specified and not in audio mode
-            if (data.mode !== "audio" && vEncoder) {
-                ffmpegArgs.push("-c:v", vEncoder);
+        const fileName = path_1.default.basename(filePath);
+        const fileNameWithoutExt = path_1.default.parse(filePath).name;
+        const dirPath = path_1.default.dirname(filePath);
+        const outputFile = path_1.default.join(dirPath, `${fileNameWithoutExt}_converted.${data.container}`);
+        log(`Converting: ${fileName}`);
+        // Build ffmpeg conversion command
+        const ffmpegArgs = [
+            "-i", filePath,
+        ];
+        // Add video codec if specified and not in audio mode
+        if (data.mode !== "audio" && vEncoder) {
+            ffmpegArgs.push("-c:v", vEncoder);
+        }
+        else if (data.mode === "audio") {
+            // Skip video for audio mode
+            ffmpegArgs.push("-vn");
+        }
+        // Add audio codec if specified
+        if (aEncoder) {
+            ffmpegArgs.push("-c:a", aEncoder);
+        }
+        ffmpegArgs.push("-y", outputFile);
+        const ffmpegProcess = (0, child_process_1.spawn)(ffmpegPath, ffmpegArgs);
+        ffmpegProcess.stdout.on("data", (d) => {
+            const output = d.toString().trim();
+            if (output) {
+                log(`[FFMPEG] ${output}`);
             }
-            else if (data.mode === "audio") {
-                // Skip video for audio mode
-                ffmpegArgs.push("-vn");
+        });
+        ffmpegProcess.stderr.on("data", (d) => {
+            const output = d.toString().trim();
+            if (output) {
+                log(`[FFMPEG] ${output}`);
             }
-            // Add audio codec if specified
-            if (aEncoder) {
-                ffmpegArgs.push("-c:a", aEncoder);
+        });
+        ffmpegProcess.on("close", (code) => {
+            if (code === 0) {
+                log(`✓ Successfully converted: ${fileName}`);
+                // Delete original file
+                try {
+                    fs_1.default.unlinkSync(filePath);
+                    log(`✓ Deleted original file: ${fileName}`);
+                    // Rename converted file to remove "_converted" suffix
+                    const finalOutputFile = path_1.default.join(dirPath, `${fileNameWithoutExt}.${data.container}`);
+                    fs_1.default.renameSync(outputFile, finalOutputFile);
+                    log(`✓ Finalized: ${fileNameWithoutExt}.${data.container}`);
+                }
+                catch (err) {
+                    log(`⚠ Warning: Could not clean up files: ${err}`);
+                }
+                log(`\n=== Conversion Complete ===`);
+                resolve(true);
             }
-            ffmpegArgs.push("-y", outputFile);
-            const ffmpegProcess = (0, child_process_1.spawn)(ffmpegPath, ffmpegArgs);
-            ffmpegProcess.stdout.on("data", (d) => {
-                const output = d.toString().trim();
-                if (output) {
-                    log(`[FFMPEG] ${output}`);
-                }
-            });
-            ffmpegProcess.stderr.on("data", (d) => {
-                const output = d.toString().trim();
-                if (output) {
-                    log(`[FFMPEG] ${output}`);
-                }
-            });
-            ffmpegProcess.on("close", (code) => {
-                if (code === 0) {
-                    log(`✓ Successfully converted: ${fileName}`);
-                    // Delete original file
-                    try {
-                        fs_1.default.unlinkSync(fullPath);
-                        log(`✓ Deleted original file: ${fileName}`);
-                        // Rename converted file to remove "_converted" suffix
-                        const finalOutputFile = path_1.default.join(dirPath, `${fileNameWithoutExt}.${data.container}`);
-                        fs_1.default.renameSync(outputFile, finalOutputFile);
-                        log(`✓ Finalized: ${fileNameWithoutExt}.${data.container}`);
-                        converted++;
-                    }
-                    catch (err) {
-                        log(`⚠ Warning: Could not clean up files: ${err}`);
-                        converted++;
-                    }
-                }
-                else {
-                    log(`✗ Error converting ${fileName}: FFmpeg exited with code ${code}`);
-                    failed++;
-                }
-                // Check if all conversions are done
-                if (converted + failed === filesToConvert.length) {
-                    log(`\n=== Conversion Summary ===`);
-                    log(`Successfully converted: ${converted}/${filesToConvert.length}`);
-                    if (failed > 0) {
-                        log(`Failed: ${failed}/${filesToConvert.length}`);
-                    }
-                    resolve(true);
-                }
-            });
+            else {
+                log(`✗ Error converting ${fileName}: FFmpeg exited with code ${code}`);
+                resolve(false);
+            }
         });
     }
     catch (err) {
