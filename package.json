@@ -1,23 +1,15 @@
 {
   "name": "youtube-downloader",
-
   "version": "1.0.0",
-
   "main": "dist/main/main.js",
-
   "scripts": {
-
     "build": "tsc",
-
     "start": "npm run build && electron ."
   },
-
   "devDependencies": {
-
     "@types/node": "^24.0.0",
-
     "electron": "^37.0.0",
-
+    "electron-builder": "^26.8.1",
     "typescript": "^5.8.3"
   }
 }
