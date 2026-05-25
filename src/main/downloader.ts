@@ -189,21 +189,21 @@ export async function startDownload(
 
             // Try to extract the final merged file from [Merger] line
             // Pattern: [Merger] Merging formats into "path/to/file.ext"
-            const mergerMatch = output.match(/\[Merger\]\s+Merging formats into\s+"([^"]+)"/i);
+            const mergerMatch = output.match(/\[Merger\]\s+Merging formats into\s+"(.+)"/);
             if (mergerMatch && mergerMatch[1]) {
                 mergedFile = mergerMatch[1].trim();
                 log(`[INFO] Detected merged file: ${mergedFile}`);
             }
 
             // Extract playlist name from download finished message
-            const playlistMatch = output.match(/\[download\]\s+Finished downloading playlist:\s+(.+)/i);
+            const playlistMatch = output.match(/\[download\]\s+Finished downloading playlist:\s+(.+)/);
             if (playlistMatch && playlistMatch[1]) {
                 playlistName = playlistMatch[1].trim();
                 log(`[INFO] Detected playlist: ${playlistName}`);
             }
 
-            // Also capture regular download destinations
-            const destMatch = output.match(/\[download\]\s+Destination:\s+(.+)/i);
+            // Also capture regular download destinations - use .+ to capture any characters including Unicode
+            const destMatch = output.match(/\[download\]\s+Destination:\s+(.+)/);
             if (destMatch && destMatch[1]) {
                 downloadedFile = destMatch[1].trim();
                 if (downloadedFile && !allDownloadedFiles.includes(downloadedFile)) {
@@ -212,8 +212,8 @@ export async function startDownload(
                 log(`[INFO] Detected file: ${downloadedFile}`);
             }
 
-            // Capture individual file downloads
-            const fileMatch = output.match(/\[download\]\s+\d+\.\d+%.*?to\s+"([^"]+)"/i);
+            // Capture individual file downloads - use .+ to capture any characters
+            const fileMatch = output.match(/\[download\]\s+\d+\.\d+%.*?to\s+"(.+)"/);
             if (fileMatch && fileMatch[1]) {
                 const file = fileMatch[1].trim();
                 if (!allDownloadedFiles.includes(file)) {
