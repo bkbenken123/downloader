@@ -23,17 +23,12 @@ const compatibility: any = {
             "default",
             "h264",
             "h265",
-            "prores422",
-            "prores4444",
             "av1"
         ],
 
         audio: [
             "default",
-            "aac",
-            "opus",
-            "flac",
-            "lpcm"
+            "aac"
         ]
     },
 
@@ -41,19 +36,12 @@ const compatibility: any = {
 
         video: [
             "default",
-            "h264",
-            "h265",
-            "prores422",
-            "prores4444",
             "av1"
         ],
 
         audio: [
             "default",
-            "aac",
-            "opus",
-            "flac",
-            "lpcm"
+            "opus"
         ]
     },
 
@@ -64,15 +52,12 @@ const compatibility: any = {
             "h264",
             "h265",
             "prores422",
-            "prores4444",
-            "av1"
+            "prores4444"
         ],
 
         audio: [
             "default",
             "aac",
-            "opus",
-            "flac",
             "lpcm"
         ]
     },
@@ -104,11 +89,7 @@ const compatibility: any = {
         ],
 
         audio: [
-            "default",
-            "aac",
-            "opus",
-            "flac",
-            "lpcm"
+            "default"
         ]
     },
 
@@ -120,10 +101,7 @@ const compatibility: any = {
 
         audio: [
             "default",
-            "aac",
-            "opus",
-            "flac",
-            "lpcm"
+            "aac"
         ]
     },
 
@@ -135,9 +113,6 @@ const compatibility: any = {
 
         audio: [
             "default",
-            "aac",
-            "opus",
-            "flac",
             "lpcm"
         ]
     },
@@ -150,10 +125,7 @@ const compatibility: any = {
 
         audio: [
             "default",
-            "aac",
-            "opus",
-            "flac",
-            "lpcm"
+            "flac"
         ]
     }
 };
