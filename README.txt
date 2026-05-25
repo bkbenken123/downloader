@@ -1,0 +1,1 @@
+COPY binaries folder to the build (downloader\release\win-unpacked)
