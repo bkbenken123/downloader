@@ -179,6 +179,8 @@ export async function startDownload(
 
         let downloadedFile: string | null = null;
         let mergedFile: string | null = null;
+        let downloadDir: string | null = null;
+        let expectedContainer: string | null = null;
         const allDownloadedFiles: string[] = [];
 
         const yt = spawn(ytdlp, args);
@@ -207,6 +209,8 @@ export async function startDownload(
             const alreadyMatch = output.match(/\[download\]\s+(.+)\s+has already been downloaded/);
             if (alreadyMatch && alreadyMatch[1]) {
                 downloadedFile = alreadyMatch[1].trim();
+                downloadDir = path.dirname(downloadedFile);
+                expectedContainer = path.extname(downloadedFile).slice(1);
                 if (downloadedFile && !allDownloadedFiles.includes(downloadedFile)) {
                     allDownloadedFiles.push(downloadedFile);
                 }
@@ -217,6 +221,8 @@ export async function startDownload(
             const destMatch = output.match(/\[download\]\s+Destination:\s+(.+)/);
             if (destMatch && destMatch[1]) {
                 downloadedFile = destMatch[1].trim();
+                downloadDir = path.dirname(downloadedFile);
+                expectedContainer = path.extname(downloadedFile).slice(1);
                 if (downloadedFile && !allDownloadedFiles.includes(downloadedFile)) {
                     allDownloadedFiles.push(downloadedFile);
                 }
@@ -251,10 +257,10 @@ export async function startDownload(
             // For playlists, construct the directory path and find files
             if (isPlaylist(data.url) && playlistName) {
                 const playlistDir = path.join(downloadsDir, playlistName);
-
+                
                 if (fs.existsSync(playlistDir)) {
                     log(`[INFO] Scanning playlist directory: ${playlistDir}`);
-
+                    
                     convertPlaylistFiles(
                         playlistDir,
                         data,
@@ -270,6 +276,24 @@ export async function startDownload(
 
             // Use merged file if available, otherwise use the last downloaded file
             let fileToConvert = mergedFile || downloadedFile;
+
+            // If we have a download directory but the exact file path is truncated,
+            // scan the directory for files with the expected container
+            if (!fileToConvert && downloadDir && expectedContainer) {
+                log(`[INFO] Scanning directory for ${expectedContainer} files: ${downloadDir}`);
+                
+                try {
+                    const files = fs.readdirSync(downloadDir);
+                    const mediaFile = files.find(f => path.extname(f).toLowerCase() === `.${expectedContainer}`);
+                    
+                    if (mediaFile) {
+                        fileToConvert = path.join(downloadDir, mediaFile);
+                        log(`[INFO] Found media file: ${fileToConvert}`);
+                    }
+                } catch (err) {
+                    log(`[WARNING] Error scanning directory: ${err}`);
+                }
+            }
 
             // If still no file, try using the first detected file
             if (!fileToConvert && allDownloadedFiles.length > 0) {
@@ -308,7 +332,7 @@ function convertPlaylistFiles(
     try {
         const files = fs.readdirSync(playlistDir);
         const supportedExts = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'mp3', 'm4a', 'wav', 'flac', 'aac', 'opus', 'ogg'];
-
+        
         const mediaFiles = files.filter(file => {
             const ext = path.extname(file).toLowerCase().slice(1);
             return ext && supportedExts.includes(ext);
@@ -327,7 +351,7 @@ function convertPlaylistFiles(
 
         mediaFiles.forEach((fileName, index) => {
             const fullPath = path.join(playlistDir, fileName);
-
+            
             log(`[${index + 1}/${mediaFiles.length}] Converting: ${fileName}`);
 
             convertFile(
@@ -428,12 +452,12 @@ function convertFile(
         ffmpegProcess.on("close", (code) => {
             if (code === 0) {
                 log(`✓ Successfully converted: ${fileName}`);
-
+                
                 // Delete original file
                 try {
                     fs.unlinkSync(filePath);
                     log(`✓ Deleted original file: ${fileName}`);
-
+                    
                     // Rename converted file to remove "_converted" suffix
                     const finalOutputFile = path.join(
                         dirPath,
@@ -441,11 +465,11 @@ function convertFile(
                     );
                     fs.renameSync(outputFile, finalOutputFile);
                     log(`✓ Finalized: ${fileNameWithoutExt}.${data.container}`);
-
+                    
                 } catch (err) {
                     log(`⚠ Warning: Could not clean up files: ${err}`);
                 }
-
+                
                 resolve(true);
             } else {
                 log(`✗ Error converting ${fileName}: FFmpeg exited with code ${code}`);
