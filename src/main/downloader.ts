@@ -184,7 +184,11 @@ export async function startDownload(
 
             let fileToConvert = mergedFile || downloadedFile;
 
-            if (!fileToConvert && downloadDir && expectedContainer) {
+            // If the file path doesn't exist but we have download info, scan the directory
+            if (fileToConvert && !fs.existsSync(fileToConvert) && downloadDir && expectedContainer) {
+                log(`[INFO] File not found at: ${fileToConvert}`);
+                log(`[INFO] Scanning directory for ${expectedContainer} files: ${downloadDir}`);
+                
                 try {
                     const files = fs.readdirSync(downloadDir);
                     const mediaFile = files.find(f =>
@@ -193,6 +197,9 @@ export async function startDownload(
 
                     if (mediaFile) {
                         fileToConvert = path.join(downloadDir, mediaFile);
+                        log(`[INFO] Found actual file: ${fileToConvert}`);
+                    } else {
+                        log(`[WARNING] No ${expectedContainer} files found in directory`);
                     }
                 } catch (err) {
                     log(`[WARNING] Error scanning directory: ${err}`);
@@ -287,10 +294,12 @@ function convertFile(
 ) {
     try {
         if (!fs.existsSync(filePath)) {
+            log(`✗ File not found: ${filePath}`);
             resolve(false);
             return;
         }
 
+        const fileName = path.basename(filePath);
         const dirPath = path.dirname(filePath);
         const fileNameWithoutExt = path.parse(filePath).name;
 
@@ -298,6 +307,8 @@ function convertFile(
             dirPath,
             `${fileNameWithoutExt}_converted.${data.container}`
         );
+
+        log(`Converting: ${fileName}`);
 
         const args: string[] = ["-i", filePath];
 
@@ -315,10 +326,26 @@ function convertFile(
 
         const proc = spawn(ffmpegPath, args);
 
+        proc.stdout.on("data", (d) => {
+            const output = d.toString().trim();
+            if (output) {
+                log(`[FFMPEG] ${output}`);
+            }
+        });
+
+        proc.stderr.on("data", (d) => {
+            const output = d.toString().trim();
+            if (output) {
+                log(`[FFMPEG] ${output}`);
+            }
+        });
+
         proc.on("close", (code) => {
             if (code === 0) {
+                log(`✓ Successfully converted: ${fileName}`);
                 try {
                     fs.unlinkSync(filePath);
+                    log(`✓ Deleted original file: ${fileName}`);
 
                     const final = path.join(
                         dirPath,
@@ -326,16 +353,20 @@ function convertFile(
                     );
 
                     fs.renameSync(outputFile, final);
+                    log(`✓ Finalized: ${fileNameWithoutExt}.${data.container}`);
                     resolve(true);
-                } catch {
+                } catch (err) {
+                    log(`⚠ Warning: Could not clean up files: ${err}`);
                     resolve(true);
                 }
             } else {
+                log(`✗ Error converting ${fileName}: FFmpeg exited with code ${code}`);
                 resolve(false);
             }
         });
 
-    } catch {
+    } catch (err) {
+        log(`Error during conversion: ${err}`);
         resolve(false);
     }
 }
