@@ -93,6 +93,8 @@ async function startDownload(data, log) {
         log(args.join(" "));
         let downloadedFile = null;
         let mergedFile = null;
+        let downloadDir = null;
+        let expectedContainer = null;
         const allDownloadedFiles = [];
         const yt = (0, child_process_1.spawn)(ytdlp, args);
         yt.stdout.on("data", d => {
@@ -116,6 +118,8 @@ async function startDownload(data, log) {
             const alreadyMatch = output.match(/\[download\]\s+(.+)\s+has already been downloaded/);
             if (alreadyMatch && alreadyMatch[1]) {
                 downloadedFile = alreadyMatch[1].trim();
+                downloadDir = path_1.default.dirname(downloadedFile);
+                expectedContainer = path_1.default.extname(downloadedFile).slice(1);
                 if (downloadedFile && !allDownloadedFiles.includes(downloadedFile)) {
                     allDownloadedFiles.push(downloadedFile);
                 }
@@ -125,6 +129,8 @@ async function startDownload(data, log) {
             const destMatch = output.match(/\[download\]\s+Destination:\s+(.+)/);
             if (destMatch && destMatch[1]) {
                 downloadedFile = destMatch[1].trim();
+                downloadDir = path_1.default.dirname(downloadedFile);
+                expectedContainer = path_1.default.extname(downloadedFile).slice(1);
                 if (downloadedFile && !allDownloadedFiles.includes(downloadedFile)) {
                     allDownloadedFiles.push(downloadedFile);
                 }
@@ -160,6 +166,22 @@ async function startDownload(data, log) {
             }
             // Use merged file if available, otherwise use the last downloaded file
             let fileToConvert = mergedFile || downloadedFile;
+            // If we have a download directory but the exact file path is truncated,
+            // scan the directory for files with the expected container
+            if (!fileToConvert && downloadDir && expectedContainer) {
+                log(`[INFO] Scanning directory for ${expectedContainer} files: ${downloadDir}`);
+                try {
+                    const files = fs_1.default.readdirSync(downloadDir);
+                    const mediaFile = files.find(f => path_1.default.extname(f).toLowerCase() === `.${expectedContainer}`);
+                    if (mediaFile) {
+                        fileToConvert = path_1.default.join(downloadDir, mediaFile);
+                        log(`[INFO] Found media file: ${fileToConvert}`);
+                    }
+                }
+                catch (err) {
+                    log(`[WARNING] Error scanning directory: ${err}`);
+                }
+            }
             // If still no file, try using the first detected file
             if (!fileToConvert && allDownloadedFiles.length > 0) {
                 fileToConvert = allDownloadedFiles[allDownloadedFiles.length - 1];
