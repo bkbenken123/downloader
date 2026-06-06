@@ -72,9 +72,11 @@ async function startDownload(data, log) {
         log(args.join(" "));
         let downloadedFile = "";
         let playlistName = "";
-        const yt = (0, child_process_1.spawn)(ytdlp, args, {
-            windowsHide: true
-        });
+        let downloadDir = "";
+        let expectedContainer = "";
+        let truncatedBase = "";
+        const allDownloadedFiles = [];
+        const yt = (0, child_process_1.spawn)(ytdlp, args, { windowsHide: true });
         yt.stdout.on("data", (d) => {
             const output = d.toString();
             log(output);
@@ -85,10 +87,30 @@ async function startDownload(data, log) {
             const destMatch = output.match(/\[download\]\s+Destination:\s+(.+)/);
             if (destMatch?.[1]) {
                 downloadedFile = destMatch[1].trim();
+                if (downloadedFile) {
+                    downloadDir = path_1.default.dirname(downloadedFile);
+                    expectedContainer = path_1.default.extname(downloadedFile).slice(1);
+                    truncatedBase = path_1.default.parse(downloadedFile).name;
+                    if (!allDownloadedFiles.includes(downloadedFile))
+                        allDownloadedFiles.push(downloadedFile);
+                }
             }
             const alreadyMatch = output.match(/\[download\]\s+(.+)\s+has already been downloaded/);
             if (alreadyMatch?.[1]) {
                 downloadedFile = alreadyMatch[1].trim();
+                if (downloadedFile) {
+                    downloadDir = path_1.default.dirname(downloadedFile);
+                    expectedContainer = path_1.default.extname(downloadedFile).slice(1);
+                    truncatedBase = path_1.default.parse(downloadedFile).name;
+                    if (!allDownloadedFiles.includes(downloadedFile))
+                        allDownloadedFiles.push(downloadedFile);
+                }
+            }
+            const fileMatch = output.match(/\[download\]\s+\d+\.\d+%.*?to\s+"(.+)"/);
+            if (fileMatch?.[1]) {
+                const file = fileMatch[1].trim();
+                if (!allDownloadedFiles.includes(file))
+                    allDownloadedFiles.push(file);
             }
         });
         yt.stderr.on("data", (d) => {
@@ -110,7 +132,67 @@ async function startDownload(data, log) {
                 resolve(true);
                 return;
             }
-            const fileToConvert = downloadedFile;
+            let fileToConvert = downloadedFile;
+            // If path doesn't exist, attempt a smarter directory scan
+            if (!fs_1.default.existsSync(fileToConvert)) {
+                log(`Detected path does not exist: ${fileToConvert}`);
+                // Small delay to allow filesystem to settle
+                setTimeout(() => {
+                    try {
+                        if (downloadDir && expectedContainer) {
+                            log(`[INFO] Scanning ${downloadDir} for *.${expectedContainer} files (looking for ${truncatedBase})`);
+                            const files = fs_1.default.readdirSync(downloadDir);
+                            const candidates = files.filter(f => path_1.default.extname(f).toLowerCase() === `.${expectedContainer}`);
+                            // Normalize for comparison
+                            const target = (truncatedBase || "").toLowerCase();
+                            const asciiTarget = target.replace(/[^\x00-\x7F]/g, "");
+                            log(`[DEBUG] Candidates: ${candidates.join(", ")}`);
+                            let found = null;
+                            for (const c of candidates) {
+                                const name = path_1.default.parse(c).name.toLowerCase();
+                                // Direct substring match
+                                if (target && name.includes(target)) {
+                                    found = c;
+                                    break;
+                                }
+                                // ASCII fallback: match ascii portion of truncated base
+                                if (asciiTarget && name.includes(asciiTarget)) {
+                                    found = c;
+                                    break;
+                                }
+                                // If truncated base is short, try startsWith
+                                if (target && target.length <= 4 && name.startsWith(target)) {
+                                    found = c;
+                                    break;
+                                }
+                            }
+                            if (found) {
+                                fileToConvert = path_1.default.join(downloadDir, found);
+                                log(`[INFO] Resolved actual file: ${fileToConvert}`);
+                            }
+                            else {
+                                log(`[WARNING] No matching file found in ${downloadDir}`);
+                                if (allDownloadedFiles.length > 0) {
+                                    fileToConvert = allDownloadedFiles[allDownloadedFiles.length - 1];
+                                    log(`[INFO] Falling back to last detected file: ${fileToConvert}`);
+                                }
+                            }
+                        }
+                    }
+                    catch (err) {
+                        log(`[ERROR] Directory scan failed: ${err}`);
+                    }
+                    if (!fileToConvert) {
+                        log("[WARNING] Could not detect downloaded file from yt-dlp output");
+                        resolve(true);
+                        return;
+                    }
+                    // proceed with conversion
+                    convertFile(fileToConvert, data, vEncoder, aEncoder, ffmpeg, log, resolve);
+                }, 150);
+                return; // we'll continue after the timeout
+            }
+            // Path exists - proceed
             convertFile(fileToConvert, data, vEncoder, aEncoder, ffmpeg, log, resolve);
         });
     });
@@ -137,10 +219,8 @@ function convertFile(filePath, data, vEncoder, aEncoder, ffmpegPath, log, resolv
         }
         args.push("-y", outputFile);
         log(`Running ffmpeg: ${args.join(" ")}`);
-        const ffmpegProcess = (0, child_process_1.spawn)(ffmpegPath, args, {
-            windowsHide: true
-        });
-        // 🔥 IMPORTANT: prevent hanging forever
+        const ffmpegProcess = (0, child_process_1.spawn)(ffmpegPath, args, { windowsHide: true });
+        // timeout to avoid hanging
         const timeout = setTimeout(() => {
             log("✗ FFmpeg timeout reached, killing process");
             ffmpegProcess.kill("SIGKILL");
