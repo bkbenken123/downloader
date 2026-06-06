@@ -111,6 +111,16 @@ async function startDownload(data, log) {
                 playlistName = playlistMatch[1].trim();
                 log(`[INFO] Detected playlist: ${playlistName}`);
             }
+            // Capture files that have already been downloaded
+            // Pattern: [download] C:\path\to\file.ext has already been downloaded
+            const alreadyMatch = output.match(/\[download\]\s+(.+)\s+has already been downloaded/);
+            if (alreadyMatch && alreadyMatch[1]) {
+                downloadedFile = alreadyMatch[1].trim();
+                if (downloadedFile && !allDownloadedFiles.includes(downloadedFile)) {
+                    allDownloadedFiles.push(downloadedFile);
+                }
+                log(`[INFO] Detected already downloaded file: ${downloadedFile}`);
+            }
             // Also capture regular download destinations - use .+ to capture any characters including Unicode
             const destMatch = output.match(/\[download\]\s+Destination:\s+(.+)/);
             if (destMatch && destMatch[1]) {
