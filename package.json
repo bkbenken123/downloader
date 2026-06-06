@@ -6,7 +6,7 @@
     "build": "tsc",
     "start": "npm run build && electron .",
     "pack": "npm run build && electron-builder --dir",
-    "dist": "npm run build && electron-builder"
+    "compile": "npm run build && electron-builder"
   },
   "build": {
     "appId": "com.youtube.downloader",
@@ -25,7 +25,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "electron": "^37.0.0",
+    "electron": "^37.10.3",
     "electron-builder": "^26.8.1",
     "typescript": "^5.8.3"
   }
