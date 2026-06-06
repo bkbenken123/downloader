@@ -90,10 +90,12 @@ export async function startDownload(
 
         let downloadedFile = "";
         let playlistName = "";
+        let downloadDir = "";
+        let expectedContainer = "";
+        let truncatedBase = "";
+        const allDownloadedFiles: string[] = [];
 
-        const yt = spawn(ytdlp, args, {
-            windowsHide: true
-        });
+        const yt = spawn(ytdlp, args, { windowsHide: true });
 
         yt.stdout.on("data", (d) => {
             const output = d.toString();
@@ -109,12 +111,30 @@ export async function startDownload(
                 output.match(/\[download\]\s+Destination:\s+(.+)/);
             if (destMatch?.[1]) {
                 downloadedFile = destMatch[1].trim();
+                if (downloadedFile) {
+                    downloadDir = path.dirname(downloadedFile);
+                    expectedContainer = path.extname(downloadedFile).slice(1);
+                    truncatedBase = path.parse(downloadedFile).name;
+                    if (!allDownloadedFiles.includes(downloadedFile)) allDownloadedFiles.push(downloadedFile);
+                }
             }
 
             const alreadyMatch =
                 output.match(/\[download\]\s+(.+)\s+has already been downloaded/);
             if (alreadyMatch?.[1]) {
                 downloadedFile = alreadyMatch[1].trim();
+                if (downloadedFile) {
+                    downloadDir = path.dirname(downloadedFile);
+                    expectedContainer = path.extname(downloadedFile).slice(1);
+                    truncatedBase = path.parse(downloadedFile).name;
+                    if (!allDownloadedFiles.includes(downloadedFile)) allDownloadedFiles.push(downloadedFile);
+                }
+            }
+
+            const fileMatch = output.match(/\[download\]\s+\d+\.\d+%.*?to\s+"(.+)"/);
+            if (fileMatch?.[1]) {
+                const file = fileMatch[1].trim();
+                if (!allDownloadedFiles.includes(file)) allDownloadedFiles.push(file);
             }
         });
 
@@ -144,8 +164,89 @@ export async function startDownload(
                 return;
             }
 
-            const fileToConvert = downloadedFile;
+            let fileToConvert = downloadedFile;
 
+            // If path doesn't exist, attempt a smarter directory scan
+            if (!fs.existsSync(fileToConvert)) {
+                log(`Detected path does not exist: ${fileToConvert}`);
+
+                // Small delay to allow filesystem to settle
+                setTimeout(() => {
+                    try {
+                        if (downloadDir && expectedContainer) {
+                            log(`[INFO] Scanning ${downloadDir} for *.${expectedContainer} files (looking for ${truncatedBase})`);
+
+                            const files = fs.readdirSync(downloadDir);
+                            const candidates = files.filter(f => path.extname(f).toLowerCase() === `.${expectedContainer}`);
+
+                            // Normalize for comparison
+                            const target = (truncatedBase || "").toLowerCase();
+                            const asciiTarget = target.replace(/[^\x00-\x7F]/g, "");
+
+                            log(`[DEBUG] Candidates: ${candidates.join(", ")}`);
+
+                            let found: string | null = null;
+
+                            for (const c of candidates) {
+                                const name = path.parse(c).name.toLowerCase();
+
+                                // Direct substring match
+                                if (target && name.includes(target)) {
+                                    found = c;
+                                    break;
+                                }
+
+                                // ASCII fallback: match ascii portion of truncated base
+                                if (asciiTarget && name.includes(asciiTarget)) {
+                                    found = c;
+                                    break;
+                                }
+
+                                // If truncated base is short, try startsWith
+                                if (target && target.length <= 4 && name.startsWith(target)) {
+                                    found = c;
+                                    break;
+                                }
+                            }
+
+                            if (found) {
+                                fileToConvert = path.join(downloadDir, found);
+                                log(`[INFO] Resolved actual file: ${fileToConvert}`);
+                            } else {
+                                log(`[WARNING] No matching file found in ${downloadDir}`);
+                                if (allDownloadedFiles.length > 0) {
+                                    fileToConvert = allDownloadedFiles[allDownloadedFiles.length - 1];
+                                    log(`[INFO] Falling back to last detected file: ${fileToConvert}`);
+                                }
+                            }
+                        }
+                    } catch (err) {
+                        log(`[ERROR] Directory scan failed: ${err}`);
+                    }
+
+                    if (!fileToConvert) {
+                        log("[WARNING] Could not detect downloaded file from yt-dlp output");
+                        resolve(true);
+                        return;
+                    }
+
+                    // proceed with conversion
+                    convertFile(
+                        fileToConvert,
+                        data,
+                        vEncoder,
+                        aEncoder,
+                        ffmpeg,
+                        log,
+                        resolve
+                    );
+
+                }, 150);
+
+                return; // we'll continue after the timeout
+            }
+
+            // Path exists - proceed
             convertFile(
                 fileToConvert,
                 data,
@@ -178,10 +279,7 @@ function convertFile(
         const dir = path.dirname(filePath);
         const name = path.parse(filePath).name;
 
-        const outputFile = path.join(
-            dir,
-            `${name}_converted.${data.container}`
-        );
+        const outputFile = path.join(dir, `${name}_converted.${data.container}`);
 
         const args: string[] = ["-i", filePath];
 
@@ -199,11 +297,9 @@ function convertFile(
 
         log(`Running ffmpeg: ${args.join(" ")}`);
 
-        const ffmpegProcess = spawn(ffmpegPath, args, {
-            windowsHide: true
-        });
+        const ffmpegProcess = spawn(ffmpegPath, args, { windowsHide: true });
 
-        // 🔥 IMPORTANT: prevent hanging forever
+        // timeout to avoid hanging
         const timeout = setTimeout(() => {
             log("✗ FFmpeg timeout reached, killing process");
             ffmpegProcess.kill("SIGKILL");
@@ -227,11 +323,7 @@ function convertFile(
                 try {
                     fs.unlinkSync(filePath);
 
-                    const final = path.join(
-                        dir,
-                        `${name}.${data.container}`
-                    );
-
+                    const final = path.join(dir, `${name}.${data.container}`);
                     fs.renameSync(outputFile, final);
 
                     log(`✓ Converted: ${final}`);
