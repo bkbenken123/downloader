@@ -39,7 +39,7 @@ export async function startDownload(
     data: DownloadRequest,
     log: (msg: string) => void
 ) {
-    return new Promise((resolve) => {
+    return new Promise<boolean>((resolve) => {
 
         const ytdlp = path.join(process.cwd(), "binaries", "yt-dlp.exe");
         const ffmpeg = path.join(process.cwd(), "binaries", "ffmpeg.exe");
@@ -50,30 +50,23 @@ export async function startDownload(
             fs.mkdirSync(downloadsDir, { recursive: true });
         }
 
-        let outputTemplate = "";
-        let playlistName = "";
+        const outputTemplate = isPlaylist(data.url)
+            ? path.join(downloadsDir, "%(playlist)s", "%(title)s.%(ext)s")
+            : path.join(downloadsDir, "%(title)s.%(ext)s");
 
-        if (isPlaylist(data.url)) {
-            outputTemplate = path.join(downloadsDir, "%(playlist)s", "%(title)s.%(ext)s");
-        } else {
-            outputTemplate = path.join(downloadsDir, "%(title)s.%(ext)s");
-        }
-
-        let args: string[] = [
+        const args: string[] = [
             "--ffmpeg-location",
             ffmpeg,
             "-o",
             outputTemplate
         ];
 
-        let requiresConversion = false;
-
         const vEncoder = getVideoEncoder(data.videoCodec);
         const aEncoder = getAudioEncoder(data.audioCodec);
 
-        if (data.videoCodec !== "default" || data.audioCodec !== "default") {
-            requiresConversion = true;
-        }
+        const requiresConversion =
+            data.videoCodec !== "default" ||
+            data.audioCodec !== "default";
 
         if (data.mode === "audio") {
             if (data.audioCodec === "default") {
@@ -96,67 +89,47 @@ export async function startDownload(
         log(args.join(" "));
 
         let downloadedFile = "";
-        let mergedFile = "";
-        let downloadDir = "";
-        let expectedContainer = "";
-        const allDownloadedFiles: string[] = [];
+        let playlistName = "";
 
-        const yt = spawn(ytdlp, args);
+        const yt = spawn(ytdlp, args, {
+            windowsHide: true
+        });
 
-        yt.stdout.on("data", d => {
+        yt.stdout.on("data", (d) => {
             const output = d.toString();
             log(output);
 
-            const mergerMatch = output.match(/\[Merger\]\s+Merging formats into\s+"(.+)"/);
-            if (mergerMatch?.[1]) {
-                mergedFile = mergerMatch[1].trim();
-                log(`[INFO] Detected merged file: ${mergedFile}`);
-            }
-
-            const playlistMatch = output.match(/\[download\]\s+Finished downloading playlist:\s+(.+)/);
+            const playlistMatch =
+                output.match(/\[download\]\s+Finished downloading playlist:\s+(.+)/);
             if (playlistMatch?.[1]) {
                 playlistName = playlistMatch[1].trim();
-                log(`[INFO] Detected playlist: ${playlistName}`);
             }
 
-            const alreadyMatch = output.match(/\[download\]\s+(.+)\s+has already been downloaded/);
-            if (alreadyMatch?.[1]) {
-                downloadedFile = alreadyMatch[1].trim();
-
-                if (downloadedFile) {
-                    downloadDir = path.dirname(downloadedFile);
-                    expectedContainer = path.extname(downloadedFile).slice(1);
-
-                    if (!allDownloadedFiles.includes(downloadedFile)) {
-                        allDownloadedFiles.push(downloadedFile);
-                    }
-                }
-
-                log(`[INFO] Detected already downloaded file: ${downloadedFile}`);
-            }
-
-            const destMatch = output.match(/\[download\]\s+Destination:\s+(.+)/);
+            const destMatch =
+                output.match(/\[download\]\s+Destination:\s+(.+)/);
             if (destMatch?.[1]) {
                 downloadedFile = destMatch[1].trim();
+            }
 
-                if (downloadedFile) {
-                    downloadDir = path.dirname(downloadedFile);
-                    expectedContainer = path.extname(downloadedFile).slice(1);
-
-                    if (!allDownloadedFiles.includes(downloadedFile)) {
-                        allDownloadedFiles.push(downloadedFile);
-                    }
-                }
-
-                log(`[INFO] Detected file: ${downloadedFile}`);
+            const alreadyMatch =
+                output.match(/\[download\]\s+(.+)\s+has already been downloaded/);
+            if (alreadyMatch?.[1]) {
+                downloadedFile = alreadyMatch[1].trim();
             }
         });
 
-        yt.stderr.on("data", d => {
+        yt.stderr.on("data", (d) => {
             log(d.toString());
         });
 
-        yt.on("close", () => {
+        yt.on("error", (err) => {
+            log(`yt-dlp error: ${err.message}`);
+            resolve(false);
+        });
+
+        yt.on("close", (code) => {
+
+            log(`yt-dlp exited with code ${code}`);
 
             if (!requiresConversion) {
                 resolve(true);
@@ -165,49 +138,13 @@ export async function startDownload(
 
             log("Starting ffmpeg conversion...");
 
-            if (isPlaylist(data.url) && playlistName) {
-                const playlistDir = path.join(downloadsDir, playlistName);
-
-                if (fs.existsSync(playlistDir)) {
-                    convertPlaylistFiles(
-                        playlistDir,
-                        data,
-                        vEncoder,
-                        aEncoder,
-                        ffmpeg,
-                        log,
-                        resolve
-                    );
-                    return;
-                }
-            }
-
-            let fileToConvert = mergedFile || downloadedFile;
-
-            if (!fileToConvert && downloadDir && expectedContainer) {
-                try {
-                    const files = fs.readdirSync(downloadDir);
-                    const mediaFile = files.find(f =>
-                        path.extname(f).toLowerCase() === `.${expectedContainer}`
-                    );
-
-                    if (mediaFile) {
-                        fileToConvert = path.join(downloadDir, mediaFile);
-                    }
-                } catch (err) {
-                    log(`[WARNING] Error scanning directory: ${err}`);
-                }
-            }
-
-            if (!fileToConvert && allDownloadedFiles.length > 0) {
-                fileToConvert = allDownloadedFiles[allDownloadedFiles.length - 1];
-            }
-
-            if (!fileToConvert) {
-                log("[WARNING] Could not detect downloaded file from yt-dlp output");
+            if (!downloadedFile) {
+                log("❌ No file detected from yt-dlp output");
                 resolve(true);
                 return;
             }
+
+            const fileToConvert = downloadedFile;
 
             convertFile(
                 fileToConvert,
@@ -222,60 +159,6 @@ export async function startDownload(
     });
 }
 
-function convertPlaylistFiles(
-    playlistDir: string,
-    data: DownloadRequest,
-    vEncoder: string | null,
-    aEncoder: string | null,
-    ffmpegPath: string,
-    log: (msg: string) => void,
-    resolve: (value: boolean) => void
-) {
-    try {
-        const files = fs.readdirSync(playlistDir);
-
-        const supportedExts = [
-            "mp4","mkv","webm","mov","avi","flv",
-            "mp3","m4a","wav","flac","aac","opus","ogg"
-        ];
-
-        const mediaFiles = files.filter(file => {
-            const ext = path.extname(file).toLowerCase().slice(1);
-            return supportedExts.includes(ext);
-        });
-
-        let done = 0;
-        let failed = 0;
-
-        if (mediaFiles.length === 0) {
-            resolve(true);
-            return;
-        }
-
-        mediaFiles.forEach((file, index) => {
-            convertFile(
-                path.join(playlistDir, file),
-                data,
-                vEncoder,
-                aEncoder,
-                ffmpegPath,
-                log,
-                (success) => {
-                    success ? done++ : failed++;
-
-                    if (done + failed === mediaFiles.length) {
-                        resolve(true);
-                    }
-                }
-            );
-        });
-
-    } catch (err) {
-        log(`Error scanning playlist directory: ${err}`);
-        resolve(false);
-    }
-}
-
 function convertFile(
     filePath: string,
     data: DownloadRequest,
@@ -287,16 +170,17 @@ function convertFile(
 ) {
     try {
         if (!fs.existsSync(filePath)) {
+            log(`✗ File not found: ${filePath}`);
             resolve(false);
             return;
         }
 
-        const dirPath = path.dirname(filePath);
-        const fileNameWithoutExt = path.parse(filePath).name;
+        const dir = path.dirname(filePath);
+        const name = path.parse(filePath).name;
 
         const outputFile = path.join(
-            dirPath,
-            `${fileNameWithoutExt}_converted.${data.container}`
+            dir,
+            `${name}_converted.${data.container}`
         );
 
         const args: string[] = ["-i", filePath];
@@ -313,29 +197,57 @@ function convertFile(
 
         args.push("-y", outputFile);
 
-        const proc = spawn(ffmpegPath, args);
+        log(`Running ffmpeg: ${args.join(" ")}`);
 
-        proc.on("close", (code) => {
+        const ffmpegProcess = spawn(ffmpegPath, args, {
+            windowsHide: true
+        });
+
+        // 🔥 IMPORTANT: prevent hanging forever
+        const timeout = setTimeout(() => {
+            log("✗ FFmpeg timeout reached, killing process");
+            ffmpegProcess.kill("SIGKILL");
+            resolve(false);
+        }, 10 * 60 * 1000);
+
+        ffmpegProcess.on("error", (err) => {
+            clearTimeout(timeout);
+            log(`✗ FFmpeg failed: ${err.message}`);
+            resolve(false);
+        });
+
+        ffmpegProcess.stderr.on("data", (d) => {
+            log(`[FFMPEG] ${d.toString()}`);
+        });
+
+        ffmpegProcess.on("close", (code) => {
+            clearTimeout(timeout);
+
             if (code === 0) {
                 try {
                     fs.unlinkSync(filePath);
 
                     const final = path.join(
-                        dirPath,
-                        `${fileNameWithoutExt}.${data.container}`
+                        dir,
+                        `${name}.${data.container}`
                     );
 
                     fs.renameSync(outputFile, final);
+
+                    log(`✓ Converted: ${final}`);
                     resolve(true);
-                } catch {
+                } catch (err) {
+                    log(`⚠ Cleanup error: ${err}`);
                     resolve(true);
                 }
             } else {
+                log(`✗ FFmpeg failed with code ${code}`);
                 resolve(false);
             }
         });
 
-    } catch {
+    } catch (err) {
+        log(`convertFile error: ${err}`);
         resolve(false);
     }
 }
