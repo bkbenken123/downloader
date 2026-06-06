@@ -202,6 +202,17 @@ export async function startDownload(
                 log(`[INFO] Detected playlist: ${playlistName}`);
             }
 
+            // Capture files that have already been downloaded
+            // Pattern: [download] C:\path\to\file.ext has already been downloaded
+            const alreadyMatch = output.match(/\[download\]\s+(.+)\s+has already been downloaded/);
+            if (alreadyMatch && alreadyMatch[1]) {
+                downloadedFile = alreadyMatch[1].trim();
+                if (downloadedFile && !allDownloadedFiles.includes(downloadedFile)) {
+                    allDownloadedFiles.push(downloadedFile);
+                }
+                log(`[INFO] Detected already downloaded file: ${downloadedFile}`);
+            }
+
             // Also capture regular download destinations - use .+ to capture any characters including Unicode
             const destMatch = output.match(/\[download\]\s+Destination:\s+(.+)/);
             if (destMatch && destMatch[1]) {
@@ -240,10 +251,10 @@ export async function startDownload(
             // For playlists, construct the directory path and find files
             if (isPlaylist(data.url) && playlistName) {
                 const playlistDir = path.join(downloadsDir, playlistName);
-                
+
                 if (fs.existsSync(playlistDir)) {
                     log(`[INFO] Scanning playlist directory: ${playlistDir}`);
-                    
+
                     convertPlaylistFiles(
                         playlistDir,
                         data,
@@ -297,7 +308,7 @@ function convertPlaylistFiles(
     try {
         const files = fs.readdirSync(playlistDir);
         const supportedExts = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'mp3', 'm4a', 'wav', 'flac', 'aac', 'opus', 'ogg'];
-        
+
         const mediaFiles = files.filter(file => {
             const ext = path.extname(file).toLowerCase().slice(1);
             return ext && supportedExts.includes(ext);
@@ -316,7 +327,7 @@ function convertPlaylistFiles(
 
         mediaFiles.forEach((fileName, index) => {
             const fullPath = path.join(playlistDir, fileName);
-            
+
             log(`[${index + 1}/${mediaFiles.length}] Converting: ${fileName}`);
 
             convertFile(
@@ -417,12 +428,12 @@ function convertFile(
         ffmpegProcess.on("close", (code) => {
             if (code === 0) {
                 log(`✓ Successfully converted: ${fileName}`);
-                
+
                 // Delete original file
                 try {
                     fs.unlinkSync(filePath);
                     log(`✓ Deleted original file: ${fileName}`);
-                    
+
                     // Rename converted file to remove "_converted" suffix
                     const finalOutputFile = path.join(
                         dirPath,
@@ -430,11 +441,11 @@ function convertFile(
                     );
                     fs.renameSync(outputFile, finalOutputFile);
                     log(`✓ Finalized: ${fileNameWithoutExt}.${data.container}`);
-                    
+
                 } catch (err) {
                     log(`⚠ Warning: Could not clean up files: ${err}`);
                 }
-                
+
                 resolve(true);
             } else {
                 log(`✗ Error converting ${fileName}: FFmpeg exited with code ${code}`);
