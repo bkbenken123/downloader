@@ -8,4 +8,6 @@ export interface DownloadRequest {
     videoCodec: string;
 
     audioCodec: string;
+
+    downloadPath: string;
 }

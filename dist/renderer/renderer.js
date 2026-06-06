@@ -150,12 +150,14 @@ document
     .getElementById("download")
     ?.addEventListener("click", async () => {
     const urlInput = document.getElementById("url");
+    const downloadPathInput = document.getElementById("downloadPath");
     const data = {
         url: urlInput.value,
         mode: mode.value,
         container: container.value,
         videoCodec: videoCodec.value,
-        audioCodec: audioCodec.value
+        audioCodec: audioCodec.value,
+        downloadPath: downloadPathInput.value
     };
     await window
         .electronAPI

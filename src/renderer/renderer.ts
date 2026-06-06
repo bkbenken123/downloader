@@ -257,6 +257,11 @@ document
                     "url"
                 ) as HTMLInputElement;
 
+            const downloadPathInput =
+                document.getElementById(
+                    "downloadPath"
+                ) as HTMLInputElement;
+
             const data = {
 
                 url:
@@ -272,7 +277,10 @@ document
                     videoCodec.value,
 
                 audioCodec:
-                    audioCodec.value
+                    audioCodec.value,
+
+                downloadPath:
+                    downloadPathInput.value
             };
 
             await (

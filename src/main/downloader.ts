@@ -8,6 +8,7 @@ interface DownloadRequest {
     container: string;
     videoCodec: string;
     audioCodec: string;
+    downloadPath: string;
 }
 
 function getVideoEncoder(codec: string): string | null {
@@ -44,7 +45,13 @@ export async function startDownload(
         const ytdlp = path.join(process.cwd(), "binaries", "yt-dlp.exe");
         const ffmpeg = path.join(process.cwd(), "binaries", "ffmpeg.exe");
 
-        const downloadsDir = path.resolve(process.cwd(), "..", "..");
+        // Use custom download path if provided, otherwise use default
+        let downloadsDir: string;
+        if (data.downloadPath && data.downloadPath.trim() !== "") {
+            downloadsDir = path.resolve(data.downloadPath);
+        } else {
+            downloadsDir = path.resolve(process.cwd(), "..", "..");
+        }
 
         if (!fs.existsSync(downloadsDir)) {
             fs.mkdirSync(downloadsDir, { recursive: true });

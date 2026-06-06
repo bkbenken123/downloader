@@ -33,7 +33,14 @@ async function startDownload(data, log) {
     return new Promise((resolve) => {
         const ytdlp = path_1.default.join(process.cwd(), "binaries", "yt-dlp.exe");
         const ffmpeg = path_1.default.join(process.cwd(), "binaries", "ffmpeg.exe");
-        const downloadsDir = path_1.default.resolve(process.cwd(), "..", "..");
+        // Use custom download path if provided, otherwise use default
+        let downloadsDir;
+        if (data.downloadPath && data.downloadPath.trim() !== "") {
+            downloadsDir = path_1.default.resolve(data.downloadPath);
+        }
+        else {
+            downloadsDir = path_1.default.resolve(process.cwd(), "..", "..");
+        }
         if (!fs_1.default.existsSync(downloadsDir)) {
             fs_1.default.mkdirSync(downloadsDir, { recursive: true });
         }
