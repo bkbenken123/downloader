@@ -1,8 +1,41 @@
-import { compatibility } from '../main/compatibility';
-
 const containers = {
   video: ['mp4', 'webm', 'mov', 'mkv'],
   audio: ['mp3', 'm4a', 'wav', 'flac']
+};
+
+const compatibility: any = {
+  mp4: {
+    video: ['default', 'h264', 'h265', 'av1'],
+    audio: ['default', 'aac']
+  },
+  webm: {
+    video: ['default', 'av1'],
+    audio: ['default', 'opus']
+  },
+  mov: {
+    video: ['default', 'h264', 'h265', 'prores422', 'prores4444'],
+    audio: ['default', 'aac', 'lpcm']
+  },
+  mkv: {
+    video: ['default', 'h264', 'h265', 'prores422', 'prores4444', 'av1'],
+    audio: ['default', 'aac', 'opus', 'flac', 'lpcm']
+  },
+  mp3: {
+    video: ['default'],
+    audio: ['default']
+  },
+  m4a: {
+    video: ['default'],
+    audio: ['default', 'aac']
+  },
+  wav: {
+    video: ['default'],
+    audio: ['default', 'lpcm']
+  },
+  flac: {
+    video: ['default'],
+    audio: ['default', 'flac']
+  }
 };
 
 const mode = document.getElementById('mode') as HTMLSelectElement;
@@ -28,7 +61,7 @@ function refreshCodecs() {
   videoCodec.innerHTML = '';
   audioCodec.innerHTML = '';
 
-  const selected = (compatibility as any)[container.value];
+  const selected = compatibility[container.value];
 
   if (!selected) {
     console.error(`No compatibility data for container: ${container.value}`);
@@ -67,7 +100,6 @@ document.getElementById('download')?.addEventListener('click', async () => {
 
   const url = urlInput.value.trim();
 
-  // Validation
   if (!url) {
     alert('Please enter a YouTube URL');
     return;
@@ -99,6 +131,6 @@ document.getElementById('download')?.addEventListener('click', async () => {
   const consoleEl = document.getElementById('console');
   if (consoleEl) {
     consoleEl.textContent += msg + '\n';
-    consoleEl.scrollTop = consoleEl.scrollHeight;
+    (consoleEl as any).scrollTop = (consoleEl as any).scrollHeight;
   }
 });
