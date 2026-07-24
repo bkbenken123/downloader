@@ -38,100 +38,84 @@ const compatibility: any = {
   }
 };
 
-let mode: HTMLSelectElement | null = null;
-let container: HTMLSelectElement | null = null;
-let videoCodec: HTMLSelectElement | null = null;
-let audioCodec: HTMLSelectElement | null = null;
-let downloadBtn: HTMLButtonElement | null = null;
-let consoleEl: HTMLPreElement | null = null;
-let urlInput: HTMLInputElement | null = null;
-let downloadPathInput: HTMLInputElement | null = null;
+function initApp() {
+  const mode = document.getElementById('mode') as HTMLSelectElement | null;
+  const container = document.getElementById('container') as HTMLSelectElement | null;
+  const videoCodec = document.getElementById('videoCodec') as HTMLSelectElement | null;
+  const audioCodec = document.getElementById('audioCodec') as HTMLSelectElement | null;
+  const downloadBtn = document.getElementById('download') as HTMLButtonElement | null;
+  const consoleEl = document.getElementById('console') as HTMLPreElement | null;
+  const urlInput = document.getElementById('url') as HTMLInputElement | null;
+  const downloadPathInput = document.getElementById('downloadPath') as HTMLInputElement | null;
 
-function initializeElements() {
-  mode = document.getElementById('mode') as HTMLSelectElement;
-  container = document.getElementById('container') as HTMLSelectElement;
-  videoCodec = document.getElementById('videoCodec') as HTMLSelectElement;
-  audioCodec = document.getElementById('audioCodec') as HTMLSelectElement;
-  downloadBtn = document.getElementById('download') as HTMLButtonElement;
-  consoleEl = document.getElementById('console') as HTMLPreElement;
-  urlInput = document.getElementById('url') as HTMLInputElement;
-  downloadPathInput = document.getElementById('downloadPath') as HTMLInputElement;
-
-  if (!mode || !container || !videoCodec || !audioCodec || !downloadBtn || !consoleEl) {
-    console.error('Required elements not found in DOM');
-    logToConsole('ERROR: Required UI elements not found. Please refresh the page.');
-    return false;
-  }
-
-  return true;
-}
-
-function logToConsole(msg: string) {
-  if (consoleEl) {
-    consoleEl.textContent += msg + '\n';
-    consoleEl.scrollTop = consoleEl.scrollHeight;
-  }
-}
-
-function fillContainers() {
-  if (!container || !mode) return;
-
-  container.innerHTML = '';
-  const list = containers[mode.value as 'video' | 'audio'];
-
-  for (const c of list) {
-    const option = document.createElement('option');
-    option.value = c;
-    option.textContent = c;
-    container.appendChild(option);
-  }
-
-  refreshCodecs();
-}
-
-function refreshCodecs() {
-  if (!videoCodec || !audioCodec || !container || !mode) return;
-
-  videoCodec.innerHTML = '';
-  audioCodec.innerHTML = '';
-
-  const selected = compatibility[container.value];
-
-  if (!selected) {
-    console.error(`No compatibility data for container: ${container.value}`);
+  if (!mode || !container || !videoCodec || !audioCodec || !downloadBtn || !consoleEl || !urlInput || !downloadPathInput) {
+    console.error('Required DOM elements not found');
     return;
   }
 
-  for (const v of selected.video) {
-    const option = document.createElement('option');
-    option.value = v;
-    option.textContent = v;
-    videoCodec.appendChild(option);
+  function logToConsole(msg: string) {
+    if (consoleEl) {
+      consoleEl.textContent += msg + '\n';
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
   }
 
-  for (const a of selected.audio) {
-    const option = document.createElement('option');
-    option.value = a;
-    option.textContent = a;
-    audioCodec.appendChild(option);
+  function fillContainers() {
+    container.innerHTML = '';
+    const list = containers[mode.value as 'video' | 'audio'];
+
+    for (const c of list) {
+      const option = document.createElement('option');
+      option.value = c;
+      option.textContent = c;
+      container.appendChild(option);
+    }
+
+    refreshCodecs();
   }
 
-  videoCodec.disabled = mode.value === 'audio';
-}
+  function refreshCodecs() {
+    videoCodec.innerHTML = '';
+    audioCodec.innerHTML = '';
 
-function setupEventListeners() {
-  if (!mode || !container || !downloadBtn) return;
+    const selected = compatibility[container.value];
 
+    if (!selected) {
+      console.error(`No compatibility data for container: ${container.value}`);
+      return;
+    }
+
+    for (const v of selected.video) {
+      const option = document.createElement('option');
+      option.value = v;
+      option.textContent = v;
+      videoCodec.appendChild(option);
+    }
+
+    for (const a of selected.audio) {
+      const option = document.createElement('option');
+      option.value = a;
+      option.textContent = a;
+      audioCodec.appendChild(option);
+    }
+
+    videoCodec.disabled = mode.value === 'audio';
+  }
+
+  // Initialize UI
+  fillContainers();
+
+  // Setup event listeners
   mode.addEventListener('change', fillContainers);
   container.addEventListener('change', refreshCodecs);
 
-  downloadBtn.addEventListener('click', async () => {
-    try {
-      if (!urlInput || !downloadPathInput || !videoCodec || !audioCodec || !mode || !container || !downloadBtn) {
-        console.error('Missing form elements');
-        return;
-      }
+  downloadBtn.addEventListener('click', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    
+    console.log('Download button clicked');
 
+    try {
       const url = urlInput.value.trim();
 
       if (!url) {
@@ -153,9 +137,8 @@ function setupEventListeners() {
         downloadPath: downloadPathInput.value.trim()
       };
 
-      if (consoleEl) {
-        consoleEl.textContent = '\n[Starting download...]\n';
-      }
+      console.log('Starting download with data:', data);
+      logToConsole('\n[Starting download...]\n');
 
       downloadBtn.disabled = true;
       downloadBtn.textContent = 'Downloading...';
@@ -167,51 +150,38 @@ function setupEventListeners() {
         throw new Error('electronAPI not available');
       }
 
+      console.log('Calling electronAPI.startDownload');
       await api.startDownload(data);
+      console.log('Download completed');
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       console.error('Download failed:', error);
-      logToConsole(`\n❌ Download failed: ${errorMsg}\n`);
+      logToConsole(`\n✗ Download failed: ${errorMsg}\n`);
     } finally {
-      if (downloadBtn) {
-        downloadBtn.disabled = false;
-        downloadBtn.textContent = 'Download';
-      }
+      downloadBtn.disabled = false;
+      downloadBtn.textContent = 'Download';
     }
   });
-}
 
-function setupConsoleListener() {
+  // Setup console listener
   const api = (window as any).electronAPI;
-  if (!api || !api.onConsole) {
-    console.error('electronAPI.onConsole not available');
-    return;
-  }
-
-  try {
-    api.onConsole((msg: string) => {
-      logToConsole(msg);
-    });
-  } catch (error) {
-    console.error('Failed to setup console listener:', error);
+  if (api && api.onConsole) {
+    try {
+      api.onConsole((msg: string) => {
+        logToConsole(msg);
+      });
+      logToConsole('✓ UI initialized successfully');
+    } catch (error) {
+      console.error('Failed to setup console listener:', error);
+    }
+  } else {
+    console.error('electronAPI not available');
   }
 }
 
-// Wait for DOM to be ready
+// Wait for DOM to be fully loaded
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => {
-    if (initializeElements()) {
-      fillContainers();
-      setupEventListeners();
-      setupConsoleListener();
-      logToConsole('✓ UI initialized successfully');
-    }
-  });
+  document.addEventListener('DOMContentLoaded', initApp);
 } else {
-  if (initializeElements()) {
-    fillContainers();
-    setupEventListeners();
-    setupConsoleListener();
-    logToConsole('✓ UI initialized successfully');
-  }
+  initApp();
 }
