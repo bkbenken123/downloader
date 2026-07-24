@@ -1,9 +1,41 @@
 "use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-const compatibility_1 = require("../main/compatibility");
 const containers = {
     video: ['mp4', 'webm', 'mov', 'mkv'],
     audio: ['mp3', 'm4a', 'wav', 'flac']
+};
+const compatibility = {
+    mp4: {
+        video: ['default', 'h264', 'h265', 'av1'],
+        audio: ['default', 'aac']
+    },
+    webm: {
+        video: ['default', 'av1'],
+        audio: ['default', 'opus']
+    },
+    mov: {
+        video: ['default', 'h264', 'h265', 'prores422', 'prores4444'],
+        audio: ['default', 'aac', 'lpcm']
+    },
+    mkv: {
+        video: ['default', 'h264', 'h265', 'prores422', 'prores4444', 'av1'],
+        audio: ['default', 'aac', 'opus', 'flac', 'lpcm']
+    },
+    mp3: {
+        video: ['default'],
+        audio: ['default']
+    },
+    m4a: {
+        video: ['default'],
+        audio: ['default', 'aac']
+    },
+    wav: {
+        video: ['default'],
+        audio: ['default', 'lpcm']
+    },
+    flac: {
+        video: ['default'],
+        audio: ['default', 'flac']
+    }
 };
 const mode = document.getElementById('mode');
 const container = document.getElementById('container');
@@ -23,7 +55,7 @@ function fillContainers() {
 function refreshCodecs() {
     videoCodec.innerHTML = '';
     audioCodec.innerHTML = '';
-    const selected = compatibility_1.compatibility[container.value];
+    const selected = compatibility[container.value];
     if (!selected) {
         console.error(`No compatibility data for container: ${container.value}`);
         return;
@@ -54,7 +86,6 @@ document.getElementById('download')?.addEventListener('click', async () => {
     const urlInput = document.getElementById('url');
     const downloadPathInput = document.getElementById('downloadPath');
     const url = urlInput.value.trim();
-    // Validation
     if (!url) {
         alert('Please enter a YouTube URL');
         return;
