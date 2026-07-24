@@ -39,6 +39,8 @@ const compatibility: any = {
 };
 
 function initApp() {
+  console.log('Initializing app...');
+  
   const mode = document.getElementById('mode') as HTMLSelectElement | null;
   const container = document.getElementById('container') as HTMLSelectElement | null;
   const videoCodec = document.getElementById('videoCodec') as HTMLSelectElement | null;
@@ -48,12 +50,17 @@ function initApp() {
   const urlInput = document.getElementById('url') as HTMLInputElement | null;
   const downloadPathInput = document.getElementById('downloadPath') as HTMLInputElement | null;
 
+  console.log('Elements found:', { mode, container, videoCodec, audioCodec, downloadBtn, consoleEl, urlInput, downloadPathInput });
+
   if (!mode || !container || !videoCodec || !audioCodec || !downloadBtn || !consoleEl || !urlInput || !downloadPathInput) {
     console.error('Required DOM elements not found');
     return;
   }
 
+  console.log('All elements found, starting initialization');
+
   function logToConsole(msg: string) {
+    console.log('[Console]', msg);
     if (consoleEl) {
       consoleEl.textContent += msg + '\n';
       consoleEl.scrollTop = consoleEl.scrollHeight;
@@ -61,10 +68,15 @@ function initApp() {
   }
 
   function fillContainers() {
-    if (!container || !mode) return;
+    console.log('Filling containers...');
+    if (!container || !mode) {
+      console.error('Container or mode is null in fillContainers');
+      return;
+    }
     
     container.innerHTML = '';
     const list = containers[mode.value as 'video' | 'audio'];
+    console.log('Container list:', list);
 
     for (const c of list) {
       const option = document.createElement('option');
@@ -77,12 +89,17 @@ function initApp() {
   }
 
   function refreshCodecs() {
-    if (!videoCodec || !audioCodec || !container || !mode) return;
+    console.log('Refreshing codecs...');
+    if (!videoCodec || !audioCodec || !container || !mode) {
+      console.error('Missing element in refreshCodecs');
+      return;
+    }
     
     videoCodec.innerHTML = '';
     audioCodec.innerHTML = '';
 
     const selected = compatibility[container.value];
+    console.log('Selected compatibility:', selected);
 
     if (!selected) {
       console.error(`No compatibility data for container: ${container.value}`);
@@ -104,23 +121,33 @@ function initApp() {
     }
 
     videoCodec.disabled = mode.value === 'audio';
+    console.log('Codecs refreshed');
   }
 
   // Initialize UI
+  console.log('Initializing UI components');
   fillContainers();
+  logToConsole('✓ UI initialized');
 
   // Setup event listeners
-  mode.addEventListener('change', fillContainers);
-  container.addEventListener('change', refreshCodecs);
+  console.log('Setting up event listeners');
+  mode.addEventListener('change', () => {
+    console.log('Mode changed to:', mode.value);
+    fillContainers();
+  });
+  container.addEventListener('change', () => {
+    console.log('Container changed to:', container.value);
+    refreshCodecs();
+  });
 
   downloadBtn.addEventListener('click', async (e: Event) => {
+    console.log('Download button clicked', e);
     e.preventDefault();
     e.stopPropagation();
-    
-    console.log('Download button clicked');
 
     try {
       const url = urlInput.value.trim();
+      console.log('URL:', url);
 
       if (!url) {
         alert('Please enter a YouTube URL');
@@ -148,6 +175,7 @@ function initApp() {
       downloadBtn.textContent = 'Downloading...';
 
       const api = (window as any).electronAPI;
+      console.log('electronAPI available:', !!api);
       if (!api || !api.startDownload) {
         console.error('electronAPI not available');
         logToConsole('ERROR: Application not properly initialized. Please restart.');
@@ -155,8 +183,9 @@ function initApp() {
       }
 
       console.log('Calling electronAPI.startDownload');
-      await api.startDownload(data);
-      console.log('Download completed');
+      const result = await api.startDownload(data);
+      console.log('Download result:', result);
+      logToConsole('✓ Download completed');
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       console.error('Download failed:', error);
@@ -168,24 +197,37 @@ function initApp() {
   });
 
   // Setup console listener
+  console.log('Setting up console listener');
   const api = (window as any).electronAPI;
+  console.log('electronAPI:', api);
   if (api && api.onConsole) {
     try {
+      console.log('Setting up onConsole listener');
       api.onConsole((msg: string) => {
+        console.log('Received console message:', msg);
         logToConsole(msg);
       });
-      logToConsole('✓ UI initialized successfully');
+      logToConsole('✓ Ready to download');
     } catch (error) {
       console.error('Failed to setup console listener:', error);
     }
   } else {
-    console.error('electronAPI not available');
+    console.error('electronAPI not available:', { api, hasOnConsole: api && api.onConsole });
+    logToConsole('⚠ electronAPI not available');
   }
+
+  console.log('App initialization complete');
 }
 
 // Wait for DOM to be fully loaded
+console.log('Document ready state:', document.readyState);
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', initApp);
+  console.log('Waiting for DOMContentLoaded');
+  document.addEventListener('DOMContentLoaded', () => {
+    console.log('DOMContentLoaded fired');
+    initApp();
+  });
 } else {
+  console.log('DOM already loaded, initializing immediately');
   initApp();
 }
