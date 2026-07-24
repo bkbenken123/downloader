@@ -36,5 +36,21 @@ exports.compatibility = {
             "flac",
             "lpcm"
         ]
+    },
+    mp3: {
+        video: ["default"],
+        audio: ["default"]
+    },
+    m4a: {
+        video: ["default"],
+        audio: ["default", "aac"]
+    },
+    wav: {
+        video: ["default"],
+        audio: ["default", "lpcm"]
+    },
+    flac: {
+        video: ["default"],
+        audio: ["default", "flac"]
     }
 };

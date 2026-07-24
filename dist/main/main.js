@@ -13,25 +13,25 @@ async function createWindow() {
         width: 1200,
         height: 850,
         webPreferences: {
-            preload: path_1.default.join(__dirname, "preload.js"),
+            preload: path_1.default.join(__dirname, 'preload.js'),
             contextIsolation: true,
             nodeIntegration: false
         }
     });
-    await mainWindow.loadFile(path_1.default.join(__dirname, "../renderer/index.html"));
-    mainWindow.webContents.send("console-output", "Application started");
+    await mainWindow.loadFile(path_1.default.join(__dirname, '../renderer/index.html'));
+    mainWindow.webContents.send('console-output', 'Application started');
     (0, updater_1.updateYtDlp)((msg) => {
-        mainWindow.webContents.send("console-output", msg);
+        mainWindow.webContents.send('console-output', msg);
     });
 }
 electron_1.app.whenReady().then(createWindow);
-electron_1.app.on("window-all-closed", () => {
-    if (process.platform !== "darwin") {
+electron_1.app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') {
         electron_1.app.quit();
     }
 });
-electron_1.ipcMain.handle("start-download", async (_, data) => {
+electron_1.ipcMain.handle('start-download', async (_, data) => {
     return await (0, downloader_1.startDownload)(data, (msg) => {
-        mainWindow.webContents.send("console-output", msg);
+        mainWindow.webContents.send('console-output', msg);
     });
 });

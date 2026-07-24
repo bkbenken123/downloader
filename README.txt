@@ -5,9 +5,8 @@ An Electron-based desktop application for downloading videos and audio from YouT
 ## Setup
 
 1. Install dependencies: `npm install`
-2. Copy binaries folder to the build output: `downloader\release\win-unpacked`
-3. Build: `npm run build`
-4. Start: `npm start`
+2. Build: `npm run build`
+3. Start: `npm start`
 
 ## Features
 
@@ -16,3 +15,8 @@ An Electron-based desktop application for downloading videos and audio from YouT
 - Custom codec selection for video and audio
 - Batch playlist downloads
 - Real-time console output
+
+
+## Compiling
+1. Compile "npm run compile"
+2. Copy binaries folder to the build output: `downloader\release\win-unpacked`
