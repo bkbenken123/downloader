@@ -57,6 +57,8 @@ function initApp() {
         }
     }
     function fillContainers() {
+        if (!container || !mode)
+            return;
         container.innerHTML = '';
         const list = containers[mode.value];
         for (const c of list) {
@@ -68,6 +70,8 @@ function initApp() {
         refreshCodecs();
     }
     function refreshCodecs() {
+        if (!videoCodec || !audioCodec || !container || !mode)
+            return;
         videoCodec.innerHTML = '';
         audioCodec.innerHTML = '';
         const selected = compatibility[container.value];
