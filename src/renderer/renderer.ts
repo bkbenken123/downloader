@@ -61,6 +61,8 @@ function initApp() {
   }
 
   function fillContainers() {
+    if (!container || !mode) return;
+    
     container.innerHTML = '';
     const list = containers[mode.value as 'video' | 'audio'];
 
@@ -75,6 +77,8 @@ function initApp() {
   }
 
   function refreshCodecs() {
+    if (!videoCodec || !audioCodec || !container || !mode) return;
+    
     videoCodec.innerHTML = '';
     audioCodec.innerHTML = '';
 
@@ -109,7 +113,7 @@ function initApp() {
   mode.addEventListener('change', fillContainers);
   container.addEventListener('change', refreshCodecs);
 
-  downloadBtn.addEventListener('click', async (e) => {
+  downloadBtn.addEventListener('click', async (e: Event) => {
     e.preventDefault();
     e.stopPropagation();
     
