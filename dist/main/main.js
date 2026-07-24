@@ -16,12 +16,17 @@ async function createWindow() {
             preload: path_1.default.join(__dirname, 'preload.js'),
             contextIsolation: true,
             nodeIntegration: false
-        }
+        },
+        show: false
     });
+    mainWindow.webContents.openDevTools();
     await mainWindow.loadFile(path_1.default.join(__dirname, '../renderer/index.html'));
-    mainWindow.webContents.send('console-output', 'Application started');
+    mainWindow.show();
+    mainWindow.webContents.send('console-output', '\n=== Application started ===\n');
     (0, updater_1.updateYtDlp)((msg) => {
-        mainWindow.webContents.send('console-output', msg);
+        if (mainWindow) {
+            mainWindow.webContents.send('console-output', msg);
+        }
     });
 }
 electron_1.app.whenReady().then(createWindow);
@@ -30,8 +35,23 @@ electron_1.app.on('window-all-closed', () => {
         electron_1.app.quit();
     }
 });
-electron_1.ipcMain.handle('start-download', async (_, data) => {
-    return await (0, downloader_1.startDownload)(data, (msg) => {
-        mainWindow.webContents.send('console-output', msg);
-    });
+electron_1.ipcMain.handle('start-download', async (event, data) => {
+    try {
+        if (!mainWindow) {
+            throw new Error('Main window not available');
+        }
+        const result = await (0, downloader_1.startDownload)(data, (msg) => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('console-output', msg);
+            }
+        });
+        return result;
+    }
+    catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('console-output', `\n❌ Error: ${errorMsg}\n`);
+        }
+        throw error;
+    }
 });
