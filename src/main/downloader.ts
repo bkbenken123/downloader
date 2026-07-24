@@ -79,6 +79,7 @@ export async function startDownload(
             if (data.audioCodec === "default") {
                 args.push("-x", "--audio-format", data.container);
             } else {
+                // Custom audio codec requires conversion - don't use -x
                 args.push("-f", "bestaudio");
             }
         } else {
@@ -179,67 +180,11 @@ export async function startDownload(
 
                 // Small delay to allow filesystem to settle
                 setTimeout(() => {
-                    try {
-                        if (downloadDir && expectedContainer) {
-                            log(`[INFO] Scanning ${downloadDir} for *.${expectedContainer} files (looking for ${truncatedBase})`);
-
-                            const files = fs.readdirSync(downloadDir);
-                            const candidates = files.filter(f => path.extname(f).toLowerCase() === `.${expectedContainer}`);
-
-                            // Normalize for comparison
-                            const target = (truncatedBase || "").toLowerCase();
-                            const asciiTarget = target.replace(/[^\x00-\x7F]/g, "");
-
-                            log(`[DEBUG] Candidates: ${candidates.join(", ")}`);
-
-                            let found: string | null = null;
-
-                            for (const c of candidates) {
-                                const name = path.parse(c).name.toLowerCase();
-
-                                // Direct substring match
-                                if (target && name.includes(target)) {
-                                    found = c;
-                                    break;
-                                }
-
-                                // ASCII fallback: match ascii portion of truncated base
-                                if (asciiTarget && name.includes(asciiTarget)) {
-                                    found = c;
-                                    break;
-                                }
-
-                                // If truncated base is short, try startsWith
-                                if (target && target.length <= 4 && name.startsWith(target)) {
-                                    found = c;
-                                    break;
-                                }
-                            }
-
-                            if (found) {
-                                fileToConvert = path.join(downloadDir, found);
-                                log(`[INFO] Resolved actual file: ${fileToConvert}`);
-                            } else {
-                                log(`[WARNING] No matching file found in ${downloadDir}`);
-                                if (allDownloadedFiles.length > 0) {
-                                    fileToConvert = allDownloadedFiles[allDownloadedFiles.length - 1];
-                                    log(`[INFO] Falling back to last detected file: ${fileToConvert}`);
-                                }
-                            }
-                        }
-                    } catch (err) {
-                        log(`[ERROR] Directory scan failed: ${err}`);
-                    }
-
-                    if (!fileToConvert) {
-                        log("[WARNING] Could not detect downloaded file from yt-dlp output");
-                        resolve(true);
-                        return;
-                    }
-
-                    // proceed with conversion
-                    convertFile(
-                        fileToConvert,
+                    performConversion(
+                        downloadDir,
+                        expectedContainer,
+                        truncatedBase,
+                        allDownloadedFiles,
                         data,
                         vEncoder,
                         aEncoder,
@@ -247,7 +192,6 @@ export async function startDownload(
                         log,
                         resolve
                     );
-
                 }, 150);
 
                 return; // we'll continue after the timeout
@@ -265,6 +209,91 @@ export async function startDownload(
             );
         });
     });
+}
+
+function performConversion(
+    downloadDir: string,
+    expectedContainer: string,
+    truncatedBase: string,
+    allDownloadedFiles: string[],
+    data: DownloadRequest,
+    vEncoder: string | null,
+    aEncoder: string | null,
+    ffmpegPath: string,
+    log: (msg: string) => void,
+    resolve: (value: boolean) => void
+) {
+    try {
+        if (downloadDir && expectedContainer) {
+            log(`[INFO] Scanning ${downloadDir} for *.${expectedContainer} files (looking for ${truncatedBase})`);
+
+            const files = fs.readdirSync(downloadDir);
+            const candidates = files.filter(f => path.extname(f).toLowerCase() === `.${expectedContainer}`);
+
+            // Normalize for comparison
+            const target = (truncatedBase || "").toLowerCase();
+            const asciiTarget = target.replace(/[^\x00-\x7F]/g, "");
+
+            log(`[DEBUG] Candidates: ${candidates.join(", ")}`);
+
+            let found: string | null = null;
+
+            for (const c of candidates) {
+                const name = path.parse(c).name.toLowerCase();
+
+                // Direct substring match
+                if (target && name.includes(target)) {
+                    found = c;
+                    break;
+                }
+
+                // ASCII fallback: match ascii portion of truncated base
+                if (asciiTarget && name.includes(asciiTarget)) {
+                    found = c;
+                    break;
+                }
+
+                // If truncated base is short, try startsWith
+                if (target && target.length <= 4 && name.startsWith(target)) {
+                    found = c;
+                    break;
+                }
+            }
+
+            let fileToConvert = "";
+
+            if (found) {
+                fileToConvert = path.join(downloadDir, found);
+                log(`[INFO] Resolved actual file: ${fileToConvert}`);
+            } else {
+                log(`[WARNING] No matching file found in ${downloadDir}`);
+                if (allDownloadedFiles.length > 0) {
+                    fileToConvert = allDownloadedFiles[allDownloadedFiles.length - 1];
+                    log(`[INFO] Falling back to last detected file: ${fileToConvert}`);
+                }
+            }
+
+            if (!fileToConvert) {
+                log("[WARNING] Could not detect downloaded file from yt-dlp output");
+                resolve(true);
+                return;
+            }
+
+            // proceed with conversion
+            convertFile(
+                fileToConvert,
+                data,
+                vEncoder,
+                aEncoder,
+                ffmpegPath,
+                log,
+                resolve
+            );
+        }
+    } catch (err) {
+        log(`[ERROR] Directory scan failed: ${err}`);
+        resolve(false);
+    }
 }
 
 function convertFile(
