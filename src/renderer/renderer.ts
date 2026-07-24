@@ -42,7 +42,7 @@ let mode: HTMLSelectElement | null = null;
 let container: HTMLSelectElement | null = null;
 let videoCodec: HTMLSelectElement | null = null;
 let audioCodec: HTMLSelectElement | null = null;
-let downloadBtn: HTMLElement | null = null;
+let downloadBtn: HTMLButtonElement | null = null;
 let consoleEl: HTMLPreElement | null = null;
 let urlInput: HTMLInputElement | null = null;
 let downloadPathInput: HTMLInputElement | null = null;
@@ -52,7 +52,7 @@ function initializeElements() {
   container = document.getElementById('container') as HTMLSelectElement;
   videoCodec = document.getElementById('videoCodec') as HTMLSelectElement;
   audioCodec = document.getElementById('audioCodec') as HTMLSelectElement;
-  downloadBtn = document.getElementById('download');
+  downloadBtn = document.getElementById('download') as HTMLButtonElement;
   consoleEl = document.getElementById('console') as HTMLPreElement;
   urlInput = document.getElementById('url') as HTMLInputElement;
   downloadPathInput = document.getElementById('downloadPath') as HTMLInputElement;
@@ -127,7 +127,7 @@ function setupEventListeners() {
 
   downloadBtn.addEventListener('click', async () => {
     try {
-      if (!urlInput || !downloadPathInput || !videoCodec || !audioCodec || !mode || !container) {
+      if (!urlInput || !downloadPathInput || !videoCodec || !audioCodec || !mode || !container || !downloadBtn) {
         console.error('Missing form elements');
         return;
       }
