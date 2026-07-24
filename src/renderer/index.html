@@ -1,20 +1,18 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <link rel="stylesheet" href="style.css">
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="style.css" />
 </head>
 
 <body>
-
     <div class="container">
-
         <h1>YouTube Downloader</h1>
 
-        <input id="url"
-               placeholder="Paste URL" />
+        <input id="url" type="text" placeholder="Paste URL" />
 
-        <input id="downloadPath"
-               placeholder="Download path (leave empty for default)" />
+        <input id="downloadPath" type="text" placeholder="Download path (leave empty for default)" />
 
         <select id="mode">
             <option value="video">Video</option>
@@ -27,15 +25,11 @@
 
         <select id="audioCodec"></select>
 
-        <button id="download">
-            Download
-        </button>
+        <button id="download">Download</button>
 
         <pre id="console"></pre>
-
     </div>
 
     <script src="renderer.js"></script>
-
 </body>
 </html>
