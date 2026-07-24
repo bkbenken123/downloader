@@ -13,15 +13,20 @@ async function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false
-    }
+    },
+    show: false
   });
 
+  mainWindow.webContents.openDevTools();
   await mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
+  mainWindow.show();
 
-  mainWindow.webContents.send('console-output', 'Application started');
+  mainWindow.webContents.send('console-output', '\n=== Application started ===\n');
 
   updateYtDlp((msg) => {
-    mainWindow.webContents.send('console-output', msg);
+    if (mainWindow) {
+      mainWindow.webContents.send('console-output', msg);
+    }
   });
 }
 
@@ -33,8 +38,24 @@ app.on('window-all-closed', () => {
   }
 });
 
-ipcMain.handle('start-download', async (_, data) => {
-  return await startDownload(data, (msg) => {
-    mainWindow.webContents.send('console-output', msg);
-  });
+ipcMain.handle('start-download', async (event, data) => {
+  try {
+    if (!mainWindow) {
+      throw new Error('Main window not available');
+    }
+
+    const result = await startDownload(data, (msg) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('console-output', msg);
+      }
+    });
+
+    return result;
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('console-output', `\n❌ Error: ${errorMsg}\n`);
+    }
+    throw error;
+  }
 });

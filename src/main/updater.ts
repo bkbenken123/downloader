@@ -1,64 +1,38 @@
-import {
-    spawn
-} from "child_process";
+import { spawn } from 'child_process';
+import path from 'path';
+import os from 'os';
 
-import path from "path";
+function getYtDlpPath(): string {
+  const platform = os.platform();
+  const ext = platform === 'win32' ? '.exe' : '';
+  return path.join(process.cwd(), 'binaries', `yt-dlp${ext}`);
+}
 
-export function updateYtDlp(
+function getFfmpegPath(): string {
+  const platform = os.platform();
+  const ext = platform === 'win32' ? '.exe' : '';
+  return path.join(process.cwd(), 'binaries', `ffmpeg${ext}`);
+}
 
-    log: (msg: string) => void
+export function updateYtDlp(log: (msg: string) => void) {
+  const ytdlp = getYtDlpPath();
+  log('\n[Checking yt-dlp updates...]\n');
 
-) {
+  const proc = spawn(ytdlp, ['-U'], { stdio: 'pipe' });
 
-    const ytdlp = path.join(
+  proc.stdout?.on('data', (d) => {
+    log(d.toString());
+  });
 
-        process.cwd(),
-        "binaries",
-        "yt-dlp.exe"
-    );
+  proc.stderr?.on('data', (d) => {
+    log(d.toString());
+  });
 
-    log("Checking yt-dlp updates...");
+  proc.on('error', (err) => {
+    log(`\n⚠ yt-dlp update check failed: ${err.message}\n`);
+  });
 
-    const proc = spawn(
-
-        ytdlp,
-
-        ["-U"]
-    );
-
-    proc.stdout.on(
-
-        "data",
-
-        (d) => {
-
-            log(
-                d.toString()
-            );
-        }
-    );
-
-    proc.stderr.on(
-
-        "data",
-
-        (d) => {
-
-            log(
-                d.toString()
-            );
-        }
-    );
-
-    proc.on(
-
-        "close",
-
-        (code) => {
-
-            log(
-                `yt-dlp updater exited with code ${code}`
-            );
-        }
-    );
+  proc.on('close', (code) => {
+    log(`\n[yt-dlp updater exited with code ${code}]\n`);
+  });
 }
