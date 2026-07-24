@@ -1,41 +1,8 @@
+import { compatibility } from '../main/compatibility';
+
 const containers = {
   video: ['mp4', 'webm', 'mov', 'mkv'],
   audio: ['mp3', 'm4a', 'wav', 'flac']
-};
-
-const compatibility: any = {
-  mp4: {
-    video: ['default', 'h264', 'h265', 'av1'],
-    audio: ['default', 'aac']
-  },
-  webm: {
-    video: ['default', 'av1'],
-    audio: ['default', 'opus']
-  },
-  mov: {
-    video: ['default', 'h264', 'h265', 'prores422', 'prores4444'],
-    audio: ['default', 'aac', 'lpcm']
-  },
-  mkv: {
-    video: ['default', 'h264', 'h265', 'prores422', 'prores4444', 'av1'],
-    audio: ['default', 'aac', 'opus', 'flac', 'lpcm']
-  },
-  mp3: {
-    video: ['default'],
-    audio: ['default']
-  },
-  m4a: {
-    video: ['default'],
-    audio: ['default', 'aac']
-  },
-  wav: {
-    video: ['default'],
-    audio: ['default', 'lpcm']
-  },
-  flac: {
-    video: ['default'],
-    audio: ['default', 'flac']
-  }
 };
 
 const mode = document.getElementById('mode') as HTMLSelectElement;
@@ -61,7 +28,12 @@ function refreshCodecs() {
   videoCodec.innerHTML = '';
   audioCodec.innerHTML = '';
 
-  const selected = compatibility[container.value];
+  const selected = (compatibility as any)[container.value];
+
+  if (!selected) {
+    console.error(`No compatibility data for container: ${container.value}`);
+    return;
+  }
 
   for (const v of selected.video) {
     const option = document.createElement('option');
@@ -93,14 +65,32 @@ document.getElementById('download')?.addEventListener('click', async () => {
   const urlInput = document.getElementById('url') as HTMLInputElement;
   const downloadPathInput = document.getElementById('downloadPath') as HTMLInputElement;
 
+  const url = urlInput.value.trim();
+
+  // Validation
+  if (!url) {
+    alert('Please enter a YouTube URL');
+    return;
+  }
+
+  if (!url.includes('youtube.com') && !url.includes('youtu.be')) {
+    alert('Please enter a valid YouTube URL');
+    return;
+  }
+
   const data = {
-    url: urlInput.value,
+    url: url,
     mode: mode.value,
     container: container.value,
     videoCodec: videoCodec.value,
     audioCodec: audioCodec.value,
-    downloadPath: downloadPathInput.value
+    downloadPath: downloadPathInput.value.trim()
   };
+
+  const consoleEl = document.getElementById('console');
+  if (consoleEl) {
+    consoleEl.textContent = '[Starting download...]\n';
+  }
 
   await (window as any).electronAPI.startDownload(data);
 });
