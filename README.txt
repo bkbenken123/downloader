@@ -1,3 +1,5 @@
+Project was made by bkbenken123
+
 # YouTube Downloader
 
 A lightweight desktop YouTube downloader built with **Python**, **yt-dlp**, **FFmpeg**, and **Tkinter**. Download videos, extract audio, or save thumbnails through a simple graphical interface.
