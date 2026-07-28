@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""
-downloader.py - AMD-first yt-dlp downloader and FFmpeg converter.
-
-Windows GPU pipeline:
-  1. Hardware encoding is permanently locked to AMD AMF.
-  2. H.264 uses h264_amf, H.265 uses hevc_amf, and AV1 uses av1_amf.
-  3. First try AMD GPU decode -> AMD AMF encode.
-  4. If hardware decoding is unsupported, use CPU decode -> AMD AMF encode.
-  5. Intel QSV and NVIDIA NVENC are never selected or invoked.
-  6. Output codecs that AMF does not support remain available through their
-     normal CPU encoders.
-
-The script looks for ffmpeg, ffprobe and yt-dlp in a local "binaries" folder,
-next to this script, and then on PATH.
-"""
-
 from __future__ import annotations
 
 import json
