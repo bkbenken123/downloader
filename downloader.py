@@ -9,24 +9,22 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
 import tkinter as tk
 from functools import lru_cache
 from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Optional
 
-try:
-    from yt_dlp import YoutubeDL
-
-    HAS_YTDLP = True
-except Exception:
-    YoutubeDL = None
-    HAS_YTDLP = False
-
-
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-APP_VERSION = "2026.07.28-amd9070-r7-reference-codecs"
+APP_VERSION = "2026.07.29-cpu-default-no-test-buttons-r3"
 AMD_PCI_VENDOR_ID = "0x1002"
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+ENCODER_BACKENDS = ("AMD", "INTEL", "NVIDIA", "CPU")
+
+DEFAULT_CONFIG = {
+    "encoder_backend": "CPU",
+    "default_download_dir": os.path.expanduser("~/Downloads"),
+    "download_playlist": True,
+}
 
 
 
@@ -83,20 +81,36 @@ VIDEO_CONTAINERS = ["mp4", "mkv", "webm", "mov"]
 AUDIO_CONTAINERS = ["mp3", "m4a", "wav", "flac", "opus"]
 THUMBNAIL_CONTAINERS = ["jpg", "png", "webp"]
 
-FORCED_GPU_MODE = "amd_amf"
-
-# AMF is hard-wired. No NVENC or QSV candidates exist anywhere in the
-# selection path, so the Intel iGPU cannot take over encoding.
 GPU_ENCODER_CANDIDATES = {
-    "h264": ["h264_amf"],
-    "h265": ["hevc_amf"],
-    "av1": ["av1_amf"],
+    "AMD": {
+        "h264": ["h264_amf"],
+        "h265": ["hevc_amf"],
+        "av1": ["av1_amf"],
+    },
+    "INTEL": {
+        "h264": ["h264_qsv"],
+        "h265": ["hevc_qsv"],
+        "vp9": ["vp9_qsv"],
+        "av1": ["av1_qsv"],
+    },
+    "NVIDIA": {
+        "h264": ["h264_nvenc"],
+        "h265": ["hevc_nvenc"],
+        "av1": ["av1_nvenc"],
+    },
 }
 
 GPU_ENCODER_LABELS = {
     "h264_amf": "AMD AMF H.264",
     "hevc_amf": "AMD AMF HEVC",
     "av1_amf": "AMD AMF AV1",
+    "h264_qsv": "Intel QSV H.264",
+    "hevc_qsv": "Intel QSV HEVC",
+    "vp9_qsv": "Intel QSV VP9",
+    "av1_qsv": "Intel QSV AV1",
+    "h264_nvenc": "NVIDIA NVENC H.264",
+    "hevc_nvenc": "NVIDIA NVENC HEVC",
+    "av1_nvenc": "NVIDIA NVENC AV1",
 }
 
 # These are intermediate/download remnants that can be removed after a final
@@ -114,6 +128,73 @@ CLEANUP_EXTS = {
     ".tmp",
     ".mp2",
 }
+
+
+# ---------------------------------------------------------------------------
+# Configuration and yt-dlp startup update
+# ---------------------------------------------------------------------------
+
+
+def _validated_config(raw: object) -> dict:
+    config = dict(DEFAULT_CONFIG)
+    if not isinstance(raw, dict):
+        return config
+
+    backend = raw.get("encoder_backend")
+    if isinstance(backend, str) and backend.upper() in ENCODER_BACKENDS:
+        config["encoder_backend"] = backend.upper()
+
+    directory = raw.get("default_download_dir")
+    if isinstance(directory, str) and directory.strip():
+        config["default_download_dir"] = os.path.abspath(os.path.expanduser(directory.strip()))
+
+    playlist = raw.get("download_playlist")
+    if isinstance(playlist, bool):
+        config["download_playlist"] = playlist
+
+    return config
+
+
+def load_config() -> tuple[dict, Optional[str]]:
+    if not os.path.isfile(CONFIG_PATH):
+        return dict(DEFAULT_CONFIG), None
+
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            return _validated_config(json.load(handle)), None
+    except Exception as exc:
+        return dict(DEFAULT_CONFIG), f"Could not read config.json; defaults were loaded: {exc}"
+
+
+def save_config(config: dict) -> None:
+    normalized = _validated_config(config)
+    changed = {
+        key: value
+        for key, value in normalized.items()
+        if value != DEFAULT_CONFIG[key]
+    }
+
+    if not changed:
+        try:
+            if os.path.isfile(CONFIG_PATH):
+                os.remove(CONFIG_PATH)
+        except OSError as exc:
+            raise OSError(f"Could not remove config.json: {exc}") from exc
+        return
+
+    temporary_path = CONFIG_PATH + ".tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            json.dump(changed, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(temporary_path, CONFIG_PATH)
+    except Exception:
+        try:
+            if os.path.isfile(temporary_path):
+                os.remove(temporary_path)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +232,93 @@ def is_playlist_info(info: object) -> bool:
 def command_text(cmd: list[str]) -> str:
     """Format a command for logs without changing what is executed."""
     return subprocess.list2cmdline([str(part) for part in cmd])
+
+
+def get_ytdlp_command() -> Optional[list[str]]:
+    executable = find_local_executable(["yt-dlp.exe", "yt-dlp", "yt_dlp.exe", "yt_dlp"])
+    if executable:
+        return [executable]
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "yt_dlp", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return [sys.executable, "-m", "yt_dlp"]
+    except Exception:
+        pass
+
+    return None
+
+
+def _run_update_command(cmd: list[str], timeout: int = 180) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        output = "\n".join(
+            part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip()
+        )
+        return int(proc.returncode), output
+    except subprocess.TimeoutExpired:
+        return -1, "Update command timed out."
+    except Exception as exc:
+        return -1, str(exc)
+
+
+def update_ytdlp_installation() -> tuple[bool, list[str]]:
+    messages: list[str] = []
+    executable = find_local_executable(["yt-dlp.exe", "yt-dlp", "yt_dlp.exe", "yt_dlp"])
+
+    if executable:
+        code, output = _run_update_command([executable, "-U"])
+        messages.append(f"yt-dlp standalone updater: {executable}")
+        if output:
+            messages.extend(line for line in output.splitlines() if line.strip())
+        if code == 0:
+            command = get_ytdlp_command()
+            return command is not None, messages
+        messages.append("Standalone update did not succeed; trying pip.")
+
+    pip_base = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "yt-dlp",
+        "--disable-pip-version-check",
+    ]
+    attempts = [pip_base]
+    if sys.prefix == getattr(sys, "base_prefix", sys.prefix):
+        attempts.append([*pip_base, "--user"])
+
+    for command in attempts:
+        code, output = _run_update_command(command)
+        messages.append(f"yt-dlp pip updater: {command_text(command)}")
+        if output:
+            messages.extend(line for line in output.splitlines() if line.strip())
+        if code == 0:
+            break
+    else:
+        return get_ytdlp_command() is not None, messages
+
+    verify_code, version_output = _run_update_command(
+        [sys.executable, "-m", "yt_dlp", "--version"], timeout=20
+    )
+    if version_output:
+        messages.append(f"Installed yt-dlp version: {version_output.splitlines()[-1]}")
+    return verify_code == 0 or get_ytdlp_command() is not None, messages
+
+
 
 
 def parse_ffmpeg_component_names(output: str) -> set[str]:
@@ -296,16 +464,6 @@ def detect_ffmpeg_features() -> dict:
     return result
 
 
-_ENCODER_TEST_CACHE: dict[tuple[str, str, str], tuple[bool, str]] = {}
-_ENCODER_TEST_LOCK = threading.Lock()
-
-
-def encoder_matches_preference(encoder: str, preference: str = FORCED_GPU_MODE) -> bool:
-    """Only AMD AMF encoders are ever eligible."""
-    del preference
-    return encoder.endswith("_amf")
-
-
 def _amd_device_init_args() -> list[str]:
     """Create D3D11 and AMF devices on the first AMD DXGI adapter."""
     return [
@@ -318,199 +476,35 @@ def _amd_device_init_args() -> list[str]:
     ]
 
 
-def _meaningful_ffmpeg_error(detail: str, max_lines: int = 8) -> str:
-    """Return useful FFmpeg diagnostics instead of only the generic final line."""
-    ignored = (
-        "nothing was written into output file",
-        "conversion failed",
-        "error while filtering",
-    )
-    lines = [line.strip() for line in detail.splitlines() if line.strip()]
-    useful = [
-        line for line in lines
-        if not any(fragment in line.lower() for fragment in ignored)
-    ]
-    chosen = useful[-max_lines:] if useful else lines[-max_lines:]
-    return "\n".join(chosen) or "initialization failed without diagnostics"
 
-
-def detect_windows_video_controllers() -> list[dict]:
-    """Read installed Windows display adapters for diagnostic logging."""
-    if sys.platform != "win32":
-        return []
-    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
-    if not powershell:
-        return []
-    command = (
-        "Get-CimInstance Win32_VideoController | "
-        "Select-Object Name,PNPDeviceID,DriverVersion,AdapterCompatibility | "
-        "ConvertTo-Json -Compress"
-    )
-    try:
-        proc = subprocess.run(
-            [powershell, "-NoProfile", "-Command", command],
-            capture_output=True,
-            text=True,
-            timeout=12,
-            check=False,
-        )
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return []
-        value = json.loads(proc.stdout)
-        if isinstance(value, dict):
-            return [value]
-        return [item for item in value if isinstance(item, dict)]
-    except Exception:
-        return []
-
-
-def probe_amd_d3d11_device(ffmpeg: str) -> tuple[bool, str]:
-    """Verify that FFmpeg can bind a D3D11 device to PCI vendor 0x1002."""
-    cmd = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "verbose",
-        "-init_hw_device",
-        f"d3d11va=amd_probe:,vendor_id={AMD_PCI_VENDOR_ID}",
-        "-f",
-        "lavfi",
-        "-i",
-        "color=c=black:s=128x128:r=30:d=0.10",
-        "-frames:v",
-        "1",
-        "-f",
-        "null",
-        "-",
-    ]
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-        detail = (proc.stderr or proc.stdout or "").strip()
-        return proc.returncode == 0, detail
-    except Exception as exc:
-        return False, str(exc)
-
-
-def _gpu_encoder_test_commands(ffmpeg: str, encoder: str) -> list[list[str]]:
-    """
-    Build realistic encoder tests.
-
-    HEVC and AV1 hardware encoders buffer output. The previous one-frame test
-    could therefore return no packet and falsely mark a working encoder as
-    unusable. Sixty 720p frames provide enough input for initialization,
-    buffering, and drain/flush behavior.
-    """
-    common_input = [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        "testsrc2=size=1280x720:rate=30:duration=2",
-        "-frames:v",
-        "60",
-        "-an",
-    ]
-    common_output = [
-        "-pix_fmt",
-        "nv12",
-        "-c:v",
-        encoder,
-        "-usage",
-        "transcoding",
-        "-f",
-        "null",
-        "-",
-    ]
-
+def _encoder_output_args(encoder: str) -> list[str]:
+    args = ["-c:v", encoder]
     if encoder.endswith("_amf"):
-        # Direct AMF is AMD's documented software-decode/hardware-encode path.
-        # It cannot select the Intel QSV device because QSV is a different API.
-        # The explicit D3D11-derived path is retained as a second test and binds
-        # the device to PCI vendor 0x1002 for multi-adapter systems.
-        return [
-            [ffmpeg, *common_input, *common_output],
-            [
-                ffmpeg,
-                *_amd_device_init_args(),
-                *common_input,
-                "-vf",
-                "format=nv12,hwupload",
-                "-c:v",
-                encoder,
-                "-usage",
-                "transcoding",
-                "-f",
-                "null",
-                "-",
-            ],
-        ]
-
-    return [[ffmpeg, *common_input, *common_output]]
-
-def test_gpu_encoder(ffmpeg: str, encoder: str, preference: str = FORCED_GPU_MODE) -> tuple[bool, str]:
-    """Verify that the selected hardware encoder can initialize on this PC."""
-    key = (os.path.normcase(ffmpeg), encoder, preference)
-    with _ENCODER_TEST_LOCK:
-        cached = _ENCODER_TEST_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    details: list[str] = []
-    ok = False
-    for cmd in _gpu_encoder_test_commands(ffmpeg, encoder):
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-            detail = (proc.stderr or proc.stdout or "").strip()
-            if detail:
-                details.append(detail)
-            if proc.returncode == 0:
-                ok = True
-                break
-        except subprocess.TimeoutExpired:
-            details.append("encoder test timed out")
-        except Exception as exc:
-            details.append(str(exc))
-
-    result = (ok, "\n".join(details))
-    with _ENCODER_TEST_LOCK:
-        _ENCODER_TEST_CACHE[key] = result
-    return result
+        args += ["-usage", "transcoding"]
+    return args
 
 
-def usable_gpu_encoders(video_codec: str, preference: str = FORCED_GPU_MODE) -> list[str]:
-    """Return compiled AMF encoders without allowing a probe to disable them."""
-    del preference
+
+def usable_gpu_encoders(video_codec: str, backend: str) -> list[str]:
+    """Return compiled encoders belonging only to the selected backend."""
     features = detect_ffmpeg_features()
     return [
         encoder
-        for encoder in GPU_ENCODER_CANDIDATES.get(video_codec, [])
-        if encoder.endswith("_amf") and encoder in features["encoders"]
+        for encoder in GPU_ENCODER_CANDIDATES.get(backend, {}).get(video_codec, [])
+        if encoder in features["encoders"]
     ]
 
 
-def gpu_decode_strategies(encoder: str, hwaccels: set[str]) -> list[tuple[str, list[str]]]:
-    """Return hardware-decode prefixes matching the selected encoder vendor."""
-    if encoder.endswith("_amf"):
+def gpu_decode_strategies(
+    encoder: str, backend: str, hwaccels: set[str]
+) -> list[tuple[str, list[str]]]:
+    """Return hardware-decode prefixes for the selected encoder backend only."""
+    if backend == "AMD":
         strategies: list[tuple[str, list[str]]] = []
-        # Explicit vendor-bound D3D11 comes first so Intel UHD cannot be picked.
         if "d3d11va" in hwaccels:
             strategies.append(
                 (
-                    "RX 9070 XT D3D11VA decode",
+                    "AMD D3D11VA decode",
                     [
                         *_amd_device_init_args(),
                         "-hwaccel",
@@ -540,15 +534,38 @@ def gpu_decode_strategies(encoder: str, hwaccels: set[str]) -> list[tuple[str, l
             )
         return strategies
 
+    if backend == "INTEL" and "qsv" in hwaccels:
+        return [
+            (
+                "Intel QSV decode",
+                [
+                    "-hwaccel",
+                    "qsv",
+                    "-hwaccel_output_format",
+                    "qsv",
+                    "-extra_hw_frames",
+                    "32",
+                ],
+            )
+        ]
+
+    if backend == "NVIDIA" and "cuda" in hwaccels:
+        return [
+            (
+                "NVIDIA CUDA decode",
+                [
+                    "-hwaccel",
+                    "cuda",
+                    "-hwaccel_output_format",
+                    "cuda",
+                    "-extra_hw_frames",
+                    "32",
+                ],
+            )
+        ]
+
     return []
 
-
-def cpu_decode_gpu_prefix_and_filter(encoder: str) -> tuple[list[str], Optional[str]]:
-    """Prepare a vendor-specific CPU-decode -> GPU-encode path."""
-    if encoder.endswith("_amf"):
-        # Explicit AMD device first. hwupload binds frames to that AMF device.
-        return _amd_device_init_args(), "format=nv12,hwupload"
-    return [], "format=nv12"
 
 def probe_input_video(src: str) -> dict:
     features = detect_ffmpeg_features()
@@ -586,34 +603,6 @@ def probe_input_video(src: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# yt-dlp logger
-# ---------------------------------------------------------------------------
-
-
-class YTDLLogger:
-    def __init__(self, output_queue: queue.Queue):
-        self.output_queue = output_queue
-
-    def debug(self, message: str) -> None:
-        # yt-dlp sends many normal progress/status messages through debug().
-        # Keep only useful non-noisy lines.
-        if message.startswith("[debug]"):
-            return
-        if message.strip():
-            self.output_queue.put(("log", message))
-
-    def info(self, message: str) -> None:
-        if message.strip():
-            self.output_queue.put(("log", message))
-
-    def warning(self, message: str) -> None:
-        self.output_queue.put(("log", f"WARNING: {message}"))
-
-    def error(self, message: str) -> None:
-        self.output_queue.put(("error", message))
-
-
-# ---------------------------------------------------------------------------
 # Download/conversion worker
 # ---------------------------------------------------------------------------
 
@@ -642,71 +631,63 @@ class Worker(threading.Thread):
             self.q.put(("log", "FFmpeg reports no hardware acceleration methods."))
 
         selected_codec = self.opts.get("video_codec", "copy")
-        self.q.put(("log", "GPU encoding is hard-locked to AMD AMF; QSV/NVENC are disabled."))
-        compiled = [
-            encoder
-            for encoder in GPU_ENCODER_CANDIDATES.get(selected_codec, [])
-            if encoder in features["encoders"]
-        ]
-        if compiled:
-            self.q.put(("log", f"Compiled AMD AMF encoder for {selected_codec}: {', '.join(compiled)}"))
+        backend = self.opts.get("encoder_backend", "CPU")
+        self.q.put(("log", f"Forced encoder backend: {backend}"))
 
-            usable = usable_gpu_encoders(selected_codec, FORCED_GPU_MODE)
-            if usable:
-                labels = [GPU_ENCODER_LABELS.get(item, item) for item in usable]
-                self.q.put(("log", f"Usable GPU encoders for {selected_codec}: {', '.join(labels)}"))
-            else:
-                self.q.put(("log", f"GPU encoders are compiled for {selected_codec}, but none initialized on this machine."))
-        elif selected_codec not in ("copy", None):
-            self.q.put(("log", f"No compiled GPU encoder found for output codec {selected_codec}."))
+        if backend == "CPU" or selected_codec in ("copy", None):
+            return
+
+        mapped = GPU_ENCODER_CANDIDATES.get(backend, {}).get(selected_codec, [])
+        compiled = [encoder for encoder in mapped if encoder in features["encoders"]]
+        if compiled:
+            labels = [GPU_ENCODER_LABELS.get(item, item) for item in compiled]
+            self.q.put(("log", f"Compiled {backend} encoder(s) for {selected_codec}: {', '.join(labels)}"))
+        elif mapped:
+            self.q.put(("log", f"No compiled {backend} encoder was found for {selected_codec}."))
+        else:
+            self.q.put(("log", f"{selected_codec} has no {backend} hardware encoder mapping."))
 
     def _get_playlist_title(self, url: str) -> Optional[str]:
-        if HAS_YTDLP and YoutubeDL is not None:
-            try:
-                options = {
-                    "logger": YTDLLogger(self.q),
-                    "quiet": True,
-                    "skip_download": True,
-                    "extract_flat": "in_playlist",
-                }
-                with YoutubeDL(options) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    if is_playlist_info(info):
-                        return info.get("title") or "playlist"
-                    return None
-            except Exception as exc:
-                self.q.put(("log", f"Playlist title lookup through Python API failed: {exc}"))
+        if not self.opts.get("download_playlist", True):
+            return None
 
-        executable = find_local_executable(["yt-dlp.exe", "yt-dlp", "yt_dlp.exe", "yt_dlp"])
-        if executable:
-            try:
-                proc = subprocess.run(
-                    [executable, url, "--dump-single-json", "--flat-playlist", "--no-warnings"],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    check=False,
-                )
-                if proc.returncode == 0:
-                    data = json.loads(proc.stdout)
-                    if is_playlist_info(data):
-                        return data.get("title") or "playlist"
-            except Exception as exc:
-                self.q.put(("log", f"Playlist title lookup through executable failed: {exc}"))
+        command = get_ytdlp_command()
+        if not command:
+            return None
 
+        try:
+            proc = subprocess.run(
+                [
+                    *command,
+                    url,
+                    "--dump-single-json",
+                    "--flat-playlist",
+                    "--no-warnings",
+                    "--yes-playlist",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+            )
+            if proc.returncode == 0:
+                data = json.loads(proc.stdout)
+                if is_playlist_info(data):
+                    return data.get("title") or "playlist"
+            elif proc.stderr.strip():
+                self.q.put(("log", f"Playlist title lookup failed: {proc.stderr.strip()}"))
+        except Exception as exc:
+            self.q.put(("log", f"Playlist title lookup failed: {exc}"))
         return None
 
     def _build_outtmpl(self, outdir: str, mode: str) -> tuple[str, str]:
+        del mode
         playlist_title = self._get_playlist_title(self.url)
         if playlist_title:
             folder = os.path.join(outdir, sanitize_filename(playlist_title))
         else:
             folder = outdir
         os.makedirs(folder, exist_ok=True)
-
-        # Always mark downloaded/intermediate files with `.temp`. This makes
-        # discovery and cleanup deterministic and avoids converting unrelated
-        # files that happen to be in the output folder.
         return os.path.join(folder, "%(title)s.temp.%(ext)s"), folder
 
     def _stream_process(self, proc: subprocess.Popen, prefix: Optional[str] = None) -> int:
@@ -731,54 +712,14 @@ class Worker(threading.Thread):
         finally:
             self.proc = None
 
-    def _run_yt_dlp_api(self, outtmpl: str, mode: str) -> bool:
-        if not HAS_YTDLP or YoutubeDL is None:
-            return False
-
-        options = {
-            "outtmpl": outtmpl,
-            "noplaylist": False,
-            "logger": YTDLLogger(self.q),
-            "quiet": False,
-            "no_warnings": True,
-            "noprogress": False,
-            "overwrites": True,
-        }
-
-        if mode == "thumbnail":
-            options.update(
-                {
-                    "skip_download": True,
-                    "writethumbnail": True,
-                }
-            )
-        elif mode == "audio":
-            options["format"] = "bestaudio/best"
-        else:
-            options["format"] = "bestvideo+bestaudio/best"
-            options["merge_output_format"] = "mkv"
-
-        try:
-            self.q.put(("log", f"Starting yt-dlp Python API: {self.url}"))
-            with YoutubeDL(options) as ydl:
-                return_code = ydl.download([self.url])
-            if return_code != 0:
-                self.q.put(("error", f"yt-dlp Python API returned code {return_code}"))
-                return False
-            self.q.put(("log", "yt-dlp Python API finished."))
-            return True
-        except Exception as exc:
-            self.q.put(("error", f"yt-dlp Python API error: {exc}"))
-            return False
-
     def _run_yt_dlp_subprocess(self, outtmpl: str, mode: str) -> bool:
-        executable = find_local_executable(["yt-dlp.exe", "yt-dlp", "yt_dlp.exe", "yt_dlp"])
-        if not executable:
-            self.q.put(("error", "yt-dlp executable was not found."))
+        command = get_ytdlp_command()
+        if not command:
+            self.q.put(("error", "yt-dlp was not found after the startup update."))
             return False
 
         cmd = [
-            executable,
+            *command,
             self.url,
             "-o",
             outtmpl,
@@ -786,6 +727,7 @@ class Worker(threading.Thread):
             "--no-color",
             "--newline",
             "--force-overwrites",
+            "--yes-playlist" if self.opts.get("download_playlist", True) else "--no-playlist",
         ]
 
         if mode == "thumbnail":
@@ -795,7 +737,7 @@ class Worker(threading.Thread):
         else:
             cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mkv"]
 
-        self.q.put(("log", f"Starting yt-dlp subprocess: {command_text(cmd)}"))
+        self.q.put(("log", f"Starting yt-dlp: {command_text(cmd)}"))
 
         try:
             proc = subprocess.Popen(
@@ -812,8 +754,7 @@ class Worker(threading.Thread):
             self.q.put(("error", f"Failed to start yt-dlp: {exc}"))
             return False
 
-        destination_paths: set[str] = set()
-        merged_paths: set[str] = set()
+        reported_paths: set[str] = set()
         destination_re = re.compile(r"Destination:\s+(.*)")
         merging_re = re.compile(r'Merging formats into\s*(?:"([^"]+)"|(.+))')
         thumbnail_re = re.compile(r"Writing video thumbnail\s+\d+\s+to:\s+(.*)")
@@ -828,29 +769,25 @@ class Worker(threading.Thread):
 
                 match = destination_re.search(text)
                 if match:
-                    destination_paths.add(os.path.abspath(match.group(1).strip().strip('"')))
+                    reported_paths.add(os.path.abspath(match.group(1).strip().strip('"')))
 
                 match = merging_re.search(text)
                 if match:
                     value = (match.group(1) or match.group(2) or "").strip().strip('"')
                     if value:
-                        merged_paths.add(os.path.abspath(value))
+                        reported_paths.add(os.path.abspath(value))
 
                 match = thumbnail_re.search(text)
                 if match:
-                    destination_paths.add(os.path.abspath(match.group(1).strip().strip('"')))
+                    reported_paths.add(os.path.abspath(match.group(1).strip().strip('"')))
 
         proc.wait()
         if proc.returncode != 0:
             self.q.put(("error", f"yt-dlp exited with code {proc.returncode}"))
             return False
 
-        if merged_paths:
-            self.downloaded_files.extend(sorted(merged_paths))
-        else:
-            self.downloaded_files.extend(sorted(destination_paths))
-
-        self.q.put(("log", "yt-dlp subprocess finished."))
+        self.downloaded_files.extend(sorted(reported_paths))
+        self.q.put(("log", "yt-dlp finished."))
         return True
 
     def _find_changed_intermediate_files(
@@ -979,6 +916,7 @@ class Worker(threading.Thread):
     ) -> bool:
         features = detect_ffmpeg_features()
         audio_args = self._audio_args(audio_codec, "video")
+        backend = self.opts.get("encoder_backend", "CPU")
 
         input_info = probe_input_video(src)
         if input_info:
@@ -1003,39 +941,65 @@ class Worker(threading.Thread):
             )
             return self._run_ffmpeg_attempt("Stream-copy/remux", cmd, dst)
 
-        gpu_encoders = usable_gpu_encoders(video_codec, FORCED_GPU_MODE)
-        if gpu_encoders:
-            self.q.put(("log", f"Forced AMD AMF encoder: {gpu_encoders[0]}"))
-        elif video_codec in ("h264", "h265", "av1"):
+        cpu_video_args = CPU_VIDEO_ENCODER_ARGS.get(video_codec)
+        if not cpu_video_args:
+            self.q.put(("error", f"No encoder mapping exists for {video_codec}."))
+            return False
+
+        if backend == "CPU":
+            self.q.put(("log", f"Forced CPU encoder for {video_codec}."))
+            cpu_cmd = [ffmpeg, "-y", "-nostdin", "-i", src]
+            cpu_cmd += self._base_video_output_args(
+                dst=dst,
+                video_args=cpu_video_args,
+                audio_args=audio_args,
+                video_codec=video_codec,
+                video_filter=None,
+            )
+            return self._run_ffmpeg_attempt("CPU decode + CPU encode", cpu_cmd, dst)
+
+        mapped_encoders = GPU_ENCODER_CANDIDATES.get(backend, {}).get(video_codec, [])
+        if not mapped_encoders:
             self.q.put(
                 (
                     "error",
-                    f"No usable AMD AMF encoder was found for {video_codec}. "
-                    "QSV and NVENC are permanently disabled. Update/install AMD Adrenalin, "
-                    "then use Test GPU to see the AMF initialization error.",
+                    f"The selected {backend} backend is forced, but {video_codec} has no "
+                    f"{backend} hardware encoder mapping. Choose CPU or a codec supported "
+                    f"by {backend}. No other backend was used.",
                 )
             )
+            return False
+
+        gpu_encoders = usable_gpu_encoders(video_codec, backend)
+        if not gpu_encoders:
+            expected = ", ".join(mapped_encoders)
+            self.q.put(
+                (
+                    "error",
+                    f"The selected {backend} backend is forced, but FFmpeg does not contain "
+                    f"a usable encoder for {video_codec}. Expected: {expected}. "
+                    "No other GPU backend and no CPU fallback were used.",
+                )
+            )
+            return False
 
         for encoder in gpu_encoders:
             label = GPU_ENCODER_LABELS.get(encoder, encoder)
+            self.q.put(("log", f"Forced {backend} encoder: {label}"))
 
-            # Try only decode paths belonging to the same GPU vendor as the
-            # encoder. AMF-only mode never invokes another encoder API, so the Intel iGPU cannot
-            # appear in the FFmpeg command or perform the encode.
             for decode_label, decode_args in gpu_decode_strategies(
-                encoder, features["hwaccels"]
+                encoder, backend, features["hwaccels"]
             ):
                 gpu_decode_cmd = [ffmpeg, "-y", "-nostdin", *decode_args, "-i", src]
                 gpu_decode_cmd += self._base_video_output_args(
                     dst=dst,
-                    video_args=(["-c:v", encoder, "-usage", "transcoding"]
-                                if encoder.endswith("_amf") else ["-c:v", encoder]),
+                    video_args=_encoder_output_args(encoder),
                     audio_args=audio_args,
                     video_codec=video_codec,
                     video_filter=None,
                 )
                 if self._run_ffmpeg_attempt(
-                    f"{decode_label} + GPU encode ({label})",
+                    f"{decode_label} + {backend} encode ({label})",
                     gpu_decode_cmd,
                     dst,
                 ):
@@ -1044,82 +1008,47 @@ class Worker(threading.Thread):
             self.q.put(
                 (
                     "log",
-                    f"GPU decoding did not work for this input; retrying CPU decode "
+                    f"Hardware decoding failed or was unavailable; retrying CPU decode "
                     f"while keeping {label} encoding.",
                 )
             )
+            direct_cmd = [ffmpeg, "-y", "-nostdin", "-i", src]
+            direct_cmd += self._base_video_output_args(
+                dst=dst,
+                video_args=_encoder_output_args(encoder),
+                audio_args=audio_args,
+                video_codec=video_codec,
+                video_filter="format=nv12",
+            )
+            if self._run_ffmpeg_attempt(
+                f"CPU decode + {backend} encode ({label})", direct_cmd, dst
+            ):
+                return True
 
-            if encoder.endswith("_amf"):
-                # AMD's documented software-decode -> AMF-encode command is the
-                # most compatible route. Intel QSV cannot be selected here.
-                direct_cmd = [ffmpeg, "-y", "-nostdin", "-i", src]
-                direct_cmd += self._base_video_output_args(
+            if backend == "AMD":
+                explicit_cmd = [ffmpeg, "-y", "-nostdin", *_amd_device_init_args(), "-i", src]
+                explicit_cmd += self._base_video_output_args(
                     dst=dst,
-                    video_args=["-c:v", encoder, "-usage", "transcoding"],
+                    video_args=_encoder_output_args(encoder),
                     audio_args=audio_args,
                     video_codec=video_codec,
-                    video_filter="format=nv12",
+                    video_filter="format=nv12,hwupload",
                 )
                 if self._run_ffmpeg_attempt(
-                    f"CPU decode + RX 9070 XT AMF encode ({label})",
-                    direct_cmd,
+                    f"CPU decode + vendor-bound AMD encode ({label})",
+                    explicit_cmd,
                     dst,
                 ):
                     return True
 
-            # Explicit vendor-bound upload fallback for current FFmpeg builds
-            # that support the AMF hardware-device context.
-            prefix, filter_expr = cpu_decode_gpu_prefix_and_filter(encoder)
-            explicit_cmd = [ffmpeg, "-y", "-nostdin", *prefix, "-i", src]
-            explicit_cmd += self._base_video_output_args(
-                dst=dst,
-                video_args=["-c:v", encoder, "-usage", "transcoding"]
-                if encoder.endswith("_amf")
-                else ["-c:v", encoder],
-                audio_args=audio_args,
-                video_codec=video_codec,
-                video_filter=filter_expr,
-            )
-            if self._run_ffmpeg_attempt(
-                f"CPU decode + vendor-bound GPU encode ({label})",
-                explicit_cmd,
-                dst,
-            ):
-                return True
-
-        # In AMD-only mode, H.264/HEVC/AV1 are hardware-supported output
-        # formats on the RX 9070 XT. Do not silently switch to CPU encoding if
-        # AMF failed; surface the driver/device problem instead.
-        if video_codec in ("h264", "h265", "av1"):
-            self.q.put(
-                (
-                    "error",
-                    f"AMD AMF encoding failed for {video_codec}. Intel QSV, NVIDIA NVENC, and CPU "
-                    "encoding were not used. Run Test GPU and check the final AMF error.",
-                )
-            )
-            return False
-
-        cpu_video_args = CPU_VIDEO_ENCODER_ARGS.get(video_codec)
-        if not cpu_video_args:
-            self.q.put(("error", f"No CPU or GPU encoder mapping exists for {video_codec}."))
-            return False
-
         self.q.put(
             (
-                "log",
-                "This output codec is not supported by AMD AMF; using its CPU encoder.",
+                "error",
+                f"Forced {backend} encoding failed for {video_codec}. "
+                "No other GPU backend and no CPU fallback were used.",
             )
         )
-        cpu_cmd = [ffmpeg, "-y", "-nostdin", "-i", src]
-        cpu_cmd += self._base_video_output_args(
-            dst=dst,
-            video_args=cpu_video_args,
-            audio_args=audio_args,
-            video_codec=video_codec,
-            video_filter=None,
-        )
-        return self._run_ffmpeg_attempt("CPU decode + CPU encode", cpu_cmd, dst)
+        return False
 
     def _convert_audio(
         self,
@@ -1237,10 +1166,7 @@ class Worker(threading.Thread):
             self.q.put(("log", f"Output template: {outtmpl}"))
 
             before_download = snapshot_temp_files(out_folder)
-            if HAS_YTDLP:
-                success = self._run_yt_dlp_api(outtmpl, mode)
-            else:
-                success = self._run_yt_dlp_subprocess(outtmpl, mode)
+            success = self._run_yt_dlp_subprocess(outtmpl, mode)
 
             if not success:
                 self.q.put(("error", "Download failed; conversion was not started."))
@@ -1249,10 +1175,10 @@ class Worker(threading.Thread):
             # Prefer paths explicitly reported by yt-dlp. Only use a
             # before/after snapshot when the API did not expose final paths.
             candidates = unique_existing_paths(self.downloaded_files)
-            if not candidates:
-                candidates = self._find_changed_intermediate_files(
-                    out_folder, before_download
-                )
+            snapshot_candidates = self._find_changed_intermediate_files(
+                out_folder, before_download
+            )
+            candidates = unique_existing_paths([*candidates, *snapshot_candidates])
             candidates.sort(key=lambda path: os.path.getmtime(path))
 
             if not candidates:
@@ -1309,6 +1235,9 @@ class App:
 
         self.q: queue.Queue = queue.Queue()
         self.worker: Optional[Worker] = None
+        self.settings, config_warning = load_config()
+        self.settings_window: Optional[tk.Toplevel] = None
+        self.ytdlp_update_in_progress = True
 
         top = ttk.Frame(root, padding=8)
         top.pack(fill="x")
@@ -1371,7 +1300,7 @@ class App:
         output_row = ttk.Frame(root, padding=6)
         output_row.pack(fill="x")
         ttk.Label(output_row, text="Output folder:").pack(side="left")
-        self.outdir_var = tk.StringVar(value=os.path.expanduser("~/Downloads"))
+        self.outdir_var = tk.StringVar(value=self.settings["default_download_dir"])
         ttk.Entry(output_row, textvariable=self.outdir_var, width=60).pack(
             side="left", padx=6, fill="x", expand=True
         )
@@ -1379,17 +1308,16 @@ class App:
 
         controls = ttk.Frame(root, padding=6)
         controls.pack(fill="x")
-        self.start_btn = ttk.Button(controls, text="Start", command=self.start)
+        self.start_btn = ttk.Button(controls, text="Start", command=self.start, state="disabled")
         self.start_btn.pack(side="left")
         ttk.Button(controls, text="Open Output Folder", command=self.open_outdir).pack(
             side="left", padx=6
         )
-        ttk.Button(controls, text="Test yt-dlp", command=self.test_ytdlp).pack(side="left", padx=6)
-        ttk.Button(controls, text="Test GPU", command=self.test_gpu).pack(side="left", padx=6)
+        ttk.Button(controls, text="Settings", command=self.open_settings).pack(side="right")
 
         status_frame = ttk.Frame(root, padding=6)
         status_frame.pack(fill="x")
-        self.status_var = tk.StringVar(value="Idle")
+        self.status_var = tk.StringVar(value="Updating yt-dlp")
         ttk.Label(status_frame, textvariable=self.status_var).pack(side="left")
 
         log_frame = ttk.LabelFrame(root, text="Log", padding=6)
@@ -1401,9 +1329,156 @@ class App:
         scrollbar.pack(side="right", fill="y")
 
         self.log(f"App started. Build: {APP_VERSION}")
-        self.log("AMD AMF encoding is forced. Intel QSV and NVIDIA NVENC are disabled.")
+        self.log(f"Encoder backend: {self.settings['encoder_backend']}")
+        self.log(
+            "Playlist downloads: "
+            + ("enabled" if self.settings["download_playlist"] else "disabled")
+        )
+        if config_warning:
+            self.log(f"WARNING: {config_warning}")
         self.on_mode_change()
+        self.root.after(100, self._start_ytdlp_update)
         self.root.after(150, self._process_queue)
+
+    def _start_ytdlp_update(self) -> None:
+        threading.Thread(target=self._startup_update_thread, daemon=True).start()
+
+    def _startup_update_thread(self) -> None:
+        self.q.put(("log", "Checking for yt-dlp updates at application startup..."))
+        success, messages = update_ytdlp_installation()
+        for message in messages:
+            self.q.put(("log", message))
+        self.q.put(("ytdlp_update_done", success, get_ytdlp_command() is not None))
+
+    def open_settings(self) -> None:
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+            self.settings_window.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        self.settings_window = window
+        window.title("Settings")
+        window.transient(self.root)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", self._close_settings)
+
+        content = ttk.Frame(window, padding=14)
+        content.pack(fill="both", expand=True)
+
+        backend_var = tk.StringVar(value=self.settings["encoder_backend"])
+        directory_var = tk.StringVar(value=self.settings["default_download_dir"])
+        playlist_var = tk.StringVar(
+            value="Yes" if self.settings["download_playlist"] else "No"
+        )
+
+        ttk.Label(content, text="Encoder backend:").grid(
+            row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 10)
+        )
+        backend_box = ttk.Combobox(
+            content,
+            textvariable=backend_var,
+            values=ENCODER_BACKENDS,
+            state="readonly",
+            width=18,
+        )
+        backend_box.grid(row=0, column=1, sticky="ew", pady=(0, 10))
+
+        ttk.Label(content, text="Default download directory:").grid(
+            row=1, column=0, sticky="w", padx=(0, 12), pady=(0, 10)
+        )
+        directory_entry = ttk.Entry(content, textvariable=directory_var, width=52)
+        directory_entry.grid(row=1, column=1, sticky="ew", pady=(0, 10))
+
+        def browse_default_directory() -> None:
+            initial = directory_var.get().strip() or DEFAULT_CONFIG["default_download_dir"]
+            selected = filedialog.askdirectory(parent=window, initialdir=initial)
+            if selected:
+                directory_var.set(selected)
+
+        ttk.Button(content, text="Browse", command=browse_default_directory).grid(
+            row=1, column=2, padx=(8, 0), pady=(0, 10)
+        )
+
+        ttk.Label(content, text="Download full playlist:").grid(
+            row=2, column=0, sticky="w", padx=(0, 12), pady=(0, 14)
+        )
+        playlist_box = ttk.Combobox(
+            content,
+            textvariable=playlist_var,
+            values=("Yes", "No"),
+            state="readonly",
+            width=18,
+        )
+        playlist_box.grid(row=2, column=1, sticky="w", pady=(0, 14))
+
+        content.columnconfigure(1, weight=1)
+
+        buttons = ttk.Frame(content)
+        buttons.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+
+        def save_settings() -> None:
+            directory = directory_var.get().strip()
+            if not directory:
+                messagebox.showerror(
+                    "Invalid directory",
+                    "Enter a default download directory.",
+                    parent=window,
+                )
+                return
+
+            new_settings = {
+                "encoder_backend": backend_var.get(),
+                "default_download_dir": os.path.abspath(os.path.expanduser(directory)),
+                "download_playlist": playlist_var.get() == "Yes",
+            }
+            try:
+                save_config(new_settings)
+            except Exception as exc:
+                messagebox.showerror(
+                    "Settings error",
+                    f"Could not save config.json:\n{exc}",
+                    parent=window,
+                )
+                return
+
+            self.settings = _validated_config(new_settings)
+            self.outdir_var.set(self.settings["default_download_dir"])
+            self.log(f"Settings saved. Encoder backend: {self.settings['encoder_backend']}")
+            self.log(
+                "Playlist downloads: "
+                + ("enabled" if self.settings["download_playlist"] else "disabled")
+            )
+            self._close_settings()
+
+        def reset_fields() -> None:
+            backend_var.set(DEFAULT_CONFIG["encoder_backend"])
+            directory_var.set(DEFAULT_CONFIG["default_download_dir"])
+            playlist_var.set("Yes" if DEFAULT_CONFIG["download_playlist"] else "No")
+
+        ttk.Button(buttons, text="Save", command=save_settings).pack(side="left")
+        ttk.Button(buttons, text="Reset to Defaults", command=reset_fields).pack(
+            side="right"
+        )
+
+        window.update_idletasks()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - window.winfo_width()) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - window.winfo_height()) // 2)
+        window.geometry(f"+{x}+{y}")
+        window.grab_set()
+        backend_box.focus_set()
+
+    def _close_settings(self) -> None:
+        if self.settings_window is not None:
+            try:
+                self.settings_window.grab_release()
+            except tk.TclError:
+                pass
+            try:
+                self.settings_window.destroy()
+            except tk.TclError:
+                pass
+            self.settings_window = None
 
     def log(self, message: str) -> None:
         self.log_text.configure(state="normal")
@@ -1541,6 +1616,19 @@ class App:
                     "Choose MKV or a compatible audio codec."
                 )
 
+            backend = self.settings["encoder_backend"]
+            if (
+                video != "copy"
+                and backend != "CPU"
+                and video not in GPU_ENCODER_CANDIDATES.get(backend, {})
+            ):
+                supported = ", ".join(GPU_ENCODER_CANDIDATES.get(backend, {}).keys())
+                return (
+                    f"Video codec '{video}' is not supported by the forced {backend} "
+                    f"encoder backend. Supported hardware codecs: {supported}. "
+                    "Choose CPU in Settings to use the software encoder."
+                )
+
         elif mode == "audio":
             if container not in AUDIO_CONTAINERS:
                 return f"Unsupported audio container: {container}."
@@ -1597,90 +1685,14 @@ class App:
         else:
             subprocess.Popen(["xdg-open", directory])
 
-    def test_ytdlp(self) -> None:
-        if HAS_YTDLP:
-            self.log("yt-dlp Python module is available.")
-
-        executable = find_local_executable(["yt-dlp.exe", "yt-dlp", "yt_dlp.exe", "yt_dlp"])
-        if executable:
-            self.log(f"yt-dlp executable: {executable}")
-        elif not HAS_YTDLP:
-            self.log("No yt-dlp Python module or executable was found.")
-
-    def _test_gpu_thread(self) -> None:
-        features = detect_ffmpeg_features()
-        ffmpeg = features.get("ffmpeg")
-        if not ffmpeg:
-            self.q.put(("log", "No ffmpeg executable was found."))
-            self.q.put(("gpu_test_done",))
+    def start(self) -> None:
+        if self.ytdlp_update_in_progress:
+            messagebox.showinfo(
+                "yt-dlp update",
+                "The startup yt-dlp update is still running.",
+            )
             return
 
-        self.q.put(("log", f"Build: {APP_VERSION}"))
-        self.q.put(("log", f"FFmpeg: {ffmpeg}"))
-        self.q.put(("log", f"Hardware acceleration methods: {', '.join(sorted(features['hwaccels'])) or 'none'}"))
-
-        controllers = detect_windows_video_controllers()
-        if controllers:
-            self.q.put(("log", "Windows display adapters:"))
-            for item in controllers:
-                self.q.put((
-                    "log",
-                    f"  - {item.get('Name', 'Unknown')} | driver={item.get('DriverVersion', '?')} | "
-                    f"PNP={item.get('PNPDeviceID', '?')}",
-                ))
-
-        amd_device_ok, amd_device_detail = probe_amd_d3d11_device(ffmpeg)
-        if amd_device_ok:
-            model_lines = [
-                line.strip() for line in amd_device_detail.splitlines()
-                if "Using device" in line or "Selecting d3d11va adapter" in line
-            ]
-            self.q.put(("log", "PASS: FFmpeg bound D3D11 to AMD vendor 0x1002."))
-            for line in model_lines[-3:]:
-                self.q.put(("log", f"  {line}"))
-        else:
-            self.q.put(("log", "FAIL: FFmpeg could not bind a D3D11 device to AMD vendor 0x1002."))
-            self.q.put(("log", _meaningful_ffmpeg_error(amd_device_detail)))
-
-        preference = FORCED_GPU_MODE
-        self.q.put(("log", "Testing forced AMD AMF encoders only."))
-        found_any = False
-        for codec in ("h264", "h265", "av1"):
-            compiled = [
-                encoder
-                for encoder in GPU_ENCODER_CANDIDATES[codec]
-                if encoder in features["encoders"]
-            ]
-            if not compiled:
-                self.q.put(("log", f"{codec}: no matching GPU encoder compiled into this FFmpeg build."))
-                continue
-
-            for encoder in compiled:
-                found_any = True
-                self.q.put(("log", f"Testing {encoder} with 60 frames..."))
-                ok, detail = test_gpu_encoder(ffmpeg, encoder, preference)
-                if ok:
-                    self.q.put(("log", f"PASS: {GPU_ENCODER_LABELS.get(encoder, encoder)}"))
-                else:
-                    self.q.put(("log", f"FAIL: {encoder}"))
-                    self.q.put(("log", _meaningful_ffmpeg_error(detail)))
-                    if encoder.endswith("_amf"):
-                        self.q.put((
-                            "log",
-                            "NOTE: Conversion will still attempt this compiled AMF encoder directly; "
-                            "the synthetic test cannot cause a fallback to another GPU encoder.",
-                        ))
-
-        if not found_any:
-            self.q.put(("log", "This FFmpeg build contains none of the selected GPU encoders."))
-
-        self.q.put(("gpu_test_done",))
-
-    def test_gpu(self) -> None:
-        self.log("Testing AMD adapter binding and compiled GPU encoders...")
-        threading.Thread(target=self._test_gpu_thread, daemon=True).start()
-
-    def start(self) -> None:
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("Already running", "A download is already running.")
             return
@@ -1716,9 +1728,7 @@ class App:
             )
             return
 
-        if not HAS_YTDLP and not find_local_executable(
-            ["yt-dlp.exe", "yt-dlp", "yt_dlp.exe", "yt_dlp"]
-        ):
+        if not get_ytdlp_command():
             messagebox.showerror(
                 "yt-dlp missing",
                 "Install yt-dlp or place yt-dlp.exe in the binaries folder.",
@@ -1737,6 +1747,8 @@ class App:
             "video_codec": self.video_codec_var.get() if mode == "video" else None,
             "audio_codec": self.audio_codec_var.get() if mode in ("video", "audio") else None,
             "outdir": outdir,
+            "encoder_backend": self.settings["encoder_backend"],
+            "download_playlist": self.settings["download_playlist"],
         }
 
         self.status_var.set("Running")
@@ -1760,8 +1772,17 @@ class App:
                     self.log(f"Finished. Output folder: {folder}")
                     self.status_var.set("Idle")
                     self.start_btn.configure(state="normal")
-                elif kind == "gpu_test_done":
-                    self.log("GPU encoder test finished.")
+                elif kind == "ytdlp_update_done":
+                    success, available = bool(item[1]), bool(item[2])
+                    self.ytdlp_update_in_progress = False
+                    self.start_btn.configure(state="normal")
+                    self.status_var.set("Idle")
+                    if success:
+                        self.log("yt-dlp startup update finished.")
+                    elif available:
+                        self.log("WARNING: yt-dlp could not be updated, but an existing installation is available.")
+                    else:
+                        self.log("ERROR: yt-dlp could not be installed or updated.")
                 else:
                     self.log(f"Unknown queue message: {item}")
         except queue.Empty:
