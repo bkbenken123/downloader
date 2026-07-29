@@ -27,7 +27,7 @@ A lightweight desktop YouTube downloader built with **Python**, **yt-dlp**, **FF
 
 The application first looks for the required executables in the following directory:
 
-```text
+```
 project/
 │
 ├── binaries/
