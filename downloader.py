@@ -15,7 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Optional
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-APP_VERSION = "2026.07.29-cpu-default-no-test-buttons-r3"
+APP_VERSION = "2026.07.29-linux-support-r4"
 AMD_PCI_VENDOR_ID = "0x1002"
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 ENCODER_BACKENDS = ("AMD", "INTEL", "NVIDIA", "CPU")
@@ -220,6 +220,37 @@ def find_local_executable(candidates: Iterable[str]) -> Optional[str]:
     return None
 
 
+def find_ffmpeg_executable(name: str) -> Optional[str]:
+    """Resolve FFmpeg tools using the platform-specific installation rule."""
+    if sys.platform.startswith("linux"):
+        path = shutil.which(name)
+        return os.path.abspath(path) if path else None
+
+    candidates = [f"{name}.exe", name] if sys.platform == "win32" else [name]
+    return find_local_executable(candidates)
+
+
+def find_ytdlp_executable() -> Optional[str]:
+    """Resolve the bundled yt-dlp executable for the current platform."""
+    if sys.platform.startswith("linux"):
+        path = os.path.join(SCRIPT_DIR, "binaries", "yt-dlp_linux")
+        if not os.path.isfile(path):
+            return None
+
+        # Archive extraction and Windows file copies can remove Linux execute
+        # permissions. Restore the user execute bit when possible.
+        if not os.access(path, os.X_OK):
+            try:
+                current_mode = os.stat(path).st_mode
+                os.chmod(path, current_mode | 0o100)
+            except OSError:
+                return None
+
+        return os.path.abspath(path)
+
+    return find_local_executable(["yt-dlp.exe", "yt-dlp", "yt_dlp.exe", "yt_dlp"])
+
+
 def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name).strip().rstrip(".")
     return cleaned or "download"
@@ -235,9 +266,14 @@ def command_text(cmd: list[str]) -> str:
 
 
 def get_ytdlp_command() -> Optional[list[str]]:
-    executable = find_local_executable(["yt-dlp.exe", "yt-dlp", "yt_dlp.exe", "yt_dlp"])
+    executable = find_ytdlp_executable()
     if executable:
         return [executable]
+
+    # Linux intentionally requires the bundled binaries/yt-dlp_linux file.
+    # Other platforms retain the Python-module fallback.
+    if sys.platform.startswith("linux"):
+        return None
 
     try:
         proc = subprocess.run(
@@ -276,7 +312,7 @@ def _run_update_command(cmd: list[str], timeout: int = 180) -> tuple[int, str]:
 
 def update_ytdlp_installation() -> tuple[bool, list[str]]:
     messages: list[str] = []
-    executable = find_local_executable(["yt-dlp.exe", "yt-dlp", "yt_dlp.exe", "yt_dlp"])
+    executable = find_ytdlp_executable()
 
     if executable:
         code, output = _run_update_command([executable, "-U"])
@@ -286,7 +322,20 @@ def update_ytdlp_installation() -> tuple[bool, list[str]]:
         if code == 0:
             command = get_ytdlp_command()
             return command is not None, messages
+
+        if sys.platform.startswith("linux"):
+            messages.append(
+                "Bundled yt-dlp_linux could not update itself; the existing binary will be used."
+            )
+            return get_ytdlp_command() is not None, messages
+
         messages.append("Standalone update did not succeed; trying pip.")
+
+    if sys.platform.startswith("linux"):
+        messages.append(
+            "Missing binaries/yt-dlp_linux. Linux does not use the pip or PATH fallback."
+        )
+        return False, messages
 
     pip_base = [
         sys.executable,
@@ -412,8 +461,8 @@ def detect_ffmpeg_features() -> dict:
         "decoders": set(),
     }
 
-    ffmpeg = find_local_executable(["ffmpeg.exe", "ffmpeg"])
-    ffprobe = find_local_executable(["ffprobe.exe", "ffprobe"])
+    ffmpeg = find_ffmpeg_executable("ffmpeg")
+    ffprobe = find_ffmpeg_executable("ffprobe")
     result["ffmpeg"] = ffmpeg
     result["ffprobe"] = ffprobe
 
@@ -620,7 +669,10 @@ class Worker(threading.Thread):
         features = detect_ffmpeg_features()
         ffmpeg = features.get("ffmpeg")
         if not ffmpeg:
-            self.q.put(("error", "ffmpeg was not found in binaries/, beside the script, or on PATH."))
+            if sys.platform.startswith("linux"):
+                self.q.put(("error", "ffmpeg was not found on the Linux system PATH."))
+            else:
+                self.q.put(("error", "ffmpeg was not found in binaries/, beside the script, or on PATH."))
             return
 
         self.q.put(("log", f"Build: {APP_VERSION}"))
@@ -1721,18 +1773,23 @@ class App:
             messagebox.showerror("Output folder error", str(exc))
             return
 
-        if not find_local_executable(["ffmpeg.exe", "ffmpeg"]):
-            messagebox.showerror(
-                "ffmpeg missing",
-                "Place ffmpeg.exe in the binaries folder or add ffmpeg to PATH.",
-            )
+        if not find_ffmpeg_executable("ffmpeg"):
+            if sys.platform.startswith("linux"):
+                ffmpeg_message = "Install ffmpeg and make sure it is available on the system PATH."
+            else:
+                ffmpeg_message = "Place ffmpeg.exe in the binaries folder or add ffmpeg to PATH."
+            messagebox.showerror("ffmpeg missing", ffmpeg_message)
             return
 
         if not get_ytdlp_command():
-            messagebox.showerror(
-                "yt-dlp missing",
-                "Install yt-dlp or place yt-dlp.exe in the binaries folder.",
-            )
+            if sys.platform.startswith("linux"):
+                ytdlp_message = (
+                    "Place the Linux yt-dlp executable at binaries/yt-dlp_linux "
+                    "beside this script."
+                )
+            else:
+                ytdlp_message = "Install yt-dlp or place yt-dlp.exe in the binaries folder."
+            messagebox.showerror("yt-dlp missing", ytdlp_message)
             return
 
         mode = self.mode_var.get()
