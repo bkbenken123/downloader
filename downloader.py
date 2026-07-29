@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#this script was made by bkbenken123
 from __future__ import annotations
 
 import json
@@ -15,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Optional
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-APP_VERSION = "2026.07.29-linux-support-r4"
+APP_VERSION = "2026.07.29"
 AMD_PCI_VENDOR_ID = "0x1002"
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 ENCODER_BACKENDS = ("AMD", "INTEL", "NVIDIA", "CPU")
