@@ -1304,7 +1304,7 @@ class Worker(threading.Thread):
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(f"Downloader - AMD RX 9070 XT / AMF encoding [{APP_VERSION}]")
+        self.root.title(f"DOWNLOADER")
         self.root.minsize(900, 520)
 
         self.q: queue.Queue = queue.Queue()
