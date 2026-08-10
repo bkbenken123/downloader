@@ -44,17 +44,16 @@ If any binaries are not found locally, the application will search your system *
 
 ## Installation
 
-Clone the repository:
-
-```bash
-git clone https://github.com/yourusername/youtube-downloader.git
-cd youtube-downloader
-```
+Clone the repository
 
 Run the application:
 
 ```bash
 python downloader.py
+```
+or
+```bash
+python downloader.pyw
 ```
 
 ---
