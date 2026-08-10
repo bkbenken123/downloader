@@ -61,7 +61,7 @@ python downloader.py
 
 ## License
 
-Licensed under the **MIT License**.
+Licensed under the **MPL License**.
 
 ---
 
