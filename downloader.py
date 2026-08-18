@@ -16,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Optional
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-APP_VERSION = "2026.07.29"
+APP_VERSION = "2026.08.15.1"
 AMD_PCI_VENDOR_ID = "0x1002"
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 ENCODER_BACKENDS = ("AMD", "INTEL", "NVIDIA", "CPU")
@@ -25,6 +25,7 @@ DEFAULT_CONFIG = {
     "encoder_backend": "CPU",
     "default_download_dir": os.path.expanduser("~/Downloads"),
     "download_playlist": True,
+    "use_ytdlp_audio_conversion": True,
 }
 
 
@@ -152,6 +153,10 @@ def _validated_config(raw: object) -> dict:
     playlist = raw.get("download_playlist")
     if isinstance(playlist, bool):
         config["download_playlist"] = playlist
+
+    ytdlp_audio = raw.get("use_ytdlp_audio_conversion")
+    if isinstance(ytdlp_audio, bool):
+        config["use_ytdlp_audio_conversion"] = ytdlp_audio
 
     return config
 
@@ -652,6 +657,42 @@ def probe_input_video(src: str) -> dict:
         return {}
 
 
+def probe_input_audio(src: str) -> dict:
+    """Return basic information about the first audio stream in *src*."""
+    features = detect_ffmpeg_features()
+    ffprobe = features.get("ffprobe")
+    if not ffprobe:
+        return {}
+
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_name,profile,sample_rate,channels",
+        "-of",
+        "json",
+        src,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return {}
+        data = json.loads(proc.stdout)
+        streams = data.get("streams") or []
+        return streams[0] if streams else {}
+    except Exception:
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # Download/conversion worker
 # ---------------------------------------------------------------------------
@@ -687,6 +728,11 @@ class Worker(threading.Thread):
         selected_codec = self.opts.get("video_codec", "copy")
         backend = self.opts.get("encoder_backend", "CPU")
         self.q.put(("log", f"Forced encoder backend: {backend}"))
+        self.q.put((
+            "log",
+            "yt-dlp audio conversion: "
+            + ("enabled" if self.opts.get("use_ytdlp_audio_conversion", True) else "disabled"),
+        ))
 
         if backend == "CPU" or selected_codec in ("copy", None):
             return
@@ -788,6 +834,21 @@ class Worker(threading.Thread):
             cmd += ["--skip-download", "--write-thumbnail"]
         elif mode == "audio":
             cmd += ["-f", "bestaudio/best"]
+            if self.opts.get("use_ytdlp_audio_conversion", True):
+                audio_format = str(self.opts.get("container") or "best").lower()
+                cmd += ["-x", "--audio-format", audio_format]
+
+                # Explicitly point yt-dlp at the same FFmpeg installation used
+                # by the application. This is especially useful for the bundled
+                # Windows binaries while still working with PATH FFmpeg on Linux.
+                ffmpeg = find_ffmpeg_executable("ffmpeg")
+                if ffmpeg:
+                    cmd += ["--ffmpeg-location", os.path.dirname(ffmpeg)]
+
+                self.q.put((
+                    "log",
+                    f"yt-dlp audio post-processing enabled: --audio-format {audio_format}",
+                ))
         else:
             cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mkv"]
 
@@ -886,6 +947,73 @@ class Worker(threading.Thread):
 
         return args
 
+    def _copy_audio_compatible(self, source_codec: str, dst: str) -> bool:
+        """Return whether an existing audio stream can be safely copied to dst."""
+        codec = (source_codec or "").lower()
+        extension = os.path.splitext(dst)[1].lower()
+
+        if extension == ".mkv":
+            return True
+        if extension == ".webm":
+            return codec in {"opus", "vorbis"}
+        if extension in {".mp4", ".mov", ".m4a"}:
+            return codec in {"aac", "alac", "mp3", "mp2", "ac3", "eac3", "flac"}
+        if extension == ".mp3":
+            return codec == "mp3"
+        if extension == ".wav":
+            return codec.startswith("pcm_")
+        if extension == ".flac":
+            return codec == "flac"
+        if extension == ".opus":
+            return codec == "opus"
+
+        return False
+
+    def _fallback_audio_codec_for_container(self, dst: str) -> Optional[str]:
+        """Pick a sane encoder when stream-copy is invalid for the destination."""
+        extension = os.path.splitext(dst)[1].lower()
+        return {
+            ".mp4": "aac",
+            ".mov": "aac",
+            ".m4a": "aac",
+            ".mp3": "mpeg-1",
+            ".wav": "lpcm",
+            ".flac": "flac",
+            ".opus": "opus",
+            ".webm": "opus",
+        }.get(extension)
+
+    def _resolved_audio_args(
+        self,
+        src: str,
+        dst: str,
+        audio_codec: Optional[str],
+        mode: str,
+    ) -> list[str]:
+        """Resolve 'copy' against the actual source codec and destination container."""
+        if audio_codec not in (None, "copy"):
+            return self._audio_args(audio_codec, mode)
+
+        info = probe_input_audio(src)
+        source_codec = str(info.get("codec_name") or "").lower()
+        if source_codec and self._copy_audio_compatible(source_codec, dst):
+            self.q.put(("log", f"Audio stream copy is compatible: {source_codec} -> {os.path.splitext(dst)[1].lower()}"))
+            return ["-c:a", "copy"]
+
+        fallback = self._fallback_audio_codec_for_container(dst)
+        if fallback:
+            shown_source = source_codec or "unknown codec"
+            self.q.put((
+                "log",
+                f"Audio stream copy is not compatible: {shown_source} -> "
+                f"{os.path.splitext(dst)[1].lower()}. Transcoding audio as {fallback} instead.",
+            ))
+            return self._audio_args(fallback, mode)
+
+        # Unknown destination: preserve the user's explicit copy request and let
+        # FFmpeg report any muxer limitation.
+        return ["-c:a", "copy"]
+
     def _muxer_args(self, dst: str, video_codec: Optional[str]) -> list[str]:
         extension = os.path.splitext(dst)[1].lower()
         args: list[str] = []
@@ -969,7 +1097,7 @@ class Worker(threading.Thread):
         audio_codec: str,
     ) -> bool:
         features = detect_ffmpeg_features()
-        audio_args = self._audio_args(audio_codec, "video")
+        audio_args = self._resolved_audio_args(src, dst, audio_codec, "video")
         backend = self.opts.get("encoder_backend", "CPU")
 
         input_info = probe_input_video(src)
@@ -1104,6 +1232,29 @@ class Worker(threading.Thread):
         )
         return False
 
+    def _finalize_ytdlp_audio(self, src: str, dst: str) -> bool:
+        """Move yt-dlp's already post-processed audio file to its final name."""
+        src_abs = os.path.abspath(src)
+        dst_abs = os.path.abspath(dst)
+
+        if os.path.normcase(src_abs) == os.path.normcase(dst_abs):
+            return os.path.isfile(dst_abs) and os.path.getsize(dst_abs) > 0
+
+        try:
+            if os.path.isfile(dst_abs):
+                os.remove(dst_abs)
+            os.replace(src_abs, dst_abs)
+        except OSError as exc:
+            self.q.put(("error", f"Could not finalize yt-dlp audio output: {exc}"))
+            return False
+
+        if not os.path.isfile(dst_abs) or os.path.getsize(dst_abs) <= 0:
+            self.q.put(("error", f"yt-dlp audio output is missing or empty: {dst_abs}"))
+            return False
+
+        self.q.put(("log", f"yt-dlp audio finalized without a second FFmpeg conversion: {dst_abs}"))
+        return True
+
     def _convert_audio(
         self,
         ffmpeg: str,
@@ -1123,7 +1274,7 @@ class Worker(threading.Thread):
             "-map_metadata",
             "0",
         ]
-        cmd += self._audio_args(audio_codec, "audio")
+        cmd += self._resolved_audio_args(src, dst, audio_codec, "audio")
         cmd += [dst]
         return self._run_ffmpeg_attempt("Audio conversion", cmd, dst)
 
@@ -1233,23 +1384,44 @@ class Worker(threading.Thread):
         candidates = unique_existing_paths([*candidates, *snapshot_candidates])
         candidates.sort(key=lambda path: os.path.getmtime(path))
 
+        use_ytdlp_audio = (
+            mode == "audio" and self.opts.get("use_ytdlp_audio_conversion", True)
+        )
+        if use_ytdlp_audio:
+            target_extension = "." + str(self.opts["container"]).lower().lstrip(".")
+            candidates = [
+                path
+                for path in candidates
+                if os.path.splitext(path)[1].lower() == target_extension
+            ]
+
         if not candidates:
-            self.q.put(("error", f"Link {index}/{total}: no newly downloaded intermediate file was found."))
+            if use_ytdlp_audio:
+                self.q.put((
+                    "error",
+                    f"Link {index}/{total}: yt-dlp did not create the requested "
+                    f"{self.opts['container']} audio file.",
+                ))
+            else:
+                self.q.put(("error", f"Link {index}/{total}: no newly downloaded intermediate file was found."))
             return False, out_folder
 
         successful_outputs: list[str] = []
         successful_pairs: list[tuple[str, str]] = []
         for src in candidates:
             final = build_final_path(src, self.opts["container"])
-            self.q.put(("log", f"Converting: {src} -> {final}"))
-
-            converted = self._ffmpeg_convert(
-                src=src,
-                dst=final,
-                mode=mode,
-                video_codec=self.opts.get("video_codec"),
-                audio_codec=self.opts.get("audio_codec"),
-            )
+            if use_ytdlp_audio:
+                self.q.put(("log", f"Finalizing yt-dlp audio: {src} -> {final}"))
+                converted = self._finalize_ytdlp_audio(src, final)
+            else:
+                self.q.put(("log", f"Converting: {src} -> {final}"))
+                converted = self._ffmpeg_convert(
+                    src=src,
+                    dst=final,
+                    mode=mode,
+                    video_codec=self.opts.get("video_codec"),
+                    audio_codec=self.opts.get("audio_codec"),
+                )
             if converted:
                 successful_outputs.append(final)
                 successful_pairs.append((src, final))
@@ -1405,6 +1577,10 @@ class App:
             "Playlist downloads: "
             + ("enabled" if self.settings["download_playlist"] else "disabled")
         )
+        self.log(
+            "yt-dlp audio conversion: "
+            + ("enabled" if self.settings["use_ytdlp_audio_conversion"] else "disabled")
+        )
         if config_warning:
             self.log(f"WARNING: {config_warning}")
         self.on_mode_change()
@@ -1441,6 +1617,9 @@ class App:
         directory_var = tk.StringVar(value=self.settings["default_download_dir"])
         playlist_var = tk.StringVar(
             value="Yes" if self.settings["download_playlist"] else "No"
+        )
+        ytdlp_audio_var = tk.BooleanVar(
+            value=self.settings["use_ytdlp_audio_conversion"]
         )
 
         ttk.Label(content, text="Encoder backend:").grid(
@@ -1481,12 +1660,18 @@ class App:
             state="readonly",
             width=18,
         )
-        playlist_box.grid(row=2, column=1, sticky="w", pady=(0, 14))
+        playlist_box.grid(row=2, column=1, sticky="w", pady=(0, 10))
+
+        ttk.Checkbutton(
+            content,
+            text="Use yt-dlp for audio format conversion (--audio-format)",
+            variable=ytdlp_audio_var,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 14))
 
         content.columnconfigure(1, weight=1)
 
         buttons = ttk.Frame(content)
-        buttons.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        buttons.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0))
 
         def save_settings() -> None:
             directory = directory_var.get().strip()
@@ -1502,6 +1687,7 @@ class App:
                 "encoder_backend": backend_var.get(),
                 "default_download_dir": os.path.abspath(os.path.expanduser(directory)),
                 "download_playlist": playlist_var.get() == "Yes",
+                "use_ytdlp_audio_conversion": bool(ytdlp_audio_var.get()),
             }
             try:
                 save_config(new_settings)
@@ -1520,12 +1706,18 @@ class App:
                 "Playlist downloads: "
                 + ("enabled" if self.settings["download_playlist"] else "disabled")
             )
+            self.log(
+                "yt-dlp audio conversion: "
+                + ("enabled" if self.settings["use_ytdlp_audio_conversion"] else "disabled")
+            )
+            self.on_mode_change()
             self._close_settings()
 
         def reset_fields() -> None:
             backend_var.set(DEFAULT_CONFIG["encoder_backend"])
             directory_var.set(DEFAULT_CONFIG["default_download_dir"])
             playlist_var.set("Yes" if DEFAULT_CONFIG["download_playlist"] else "No")
+            ytdlp_audio_var.set(DEFAULT_CONFIG["use_ytdlp_audio_conversion"])
 
         ttk.Button(buttons, text="Save", command=save_settings).pack(side="left")
         ttk.Button(buttons, text="Reset to Defaults", command=reset_fields).pack(
@@ -1611,7 +1803,13 @@ class App:
             if self.container_var.get() not in containers:
                 self.container_var.set("mp3")
             self.video_codec_dd.configure(state="disabled")
-            self.audio_codec_dd.configure(state="normal")
+            self.audio_codec_dd.configure(
+                state=(
+                    "disabled"
+                    if self.settings.get("use_ytdlp_audio_conversion", True)
+                    else "normal"
+                )
+            )
         else:
             containers = list(THUMBNAIL_CONTAINERS)
             self._set_option_menu(
@@ -1703,6 +1901,13 @@ class App:
         elif mode == "audio":
             if container not in AUDIO_CONTAINERS:
                 return f"Unsupported audio container: {container}."
+
+            # When enabled, yt-dlp's ExtractAudio postprocessor owns the audio
+            # format conversion, so the separate FFmpeg audio-codec selector is
+            # intentionally ignored for audio-only downloads.
+            if self.settings.get("use_ytdlp_audio_conversion", True):
+                return None
+
             if audio not in AUDIO_CODECS:
                 return f"Unsupported audio codec: {audio}."
 
@@ -1835,6 +2040,7 @@ class App:
             "outdir": outdir,
             "encoder_backend": self.settings["encoder_backend"],
             "download_playlist": self.settings["download_playlist"],
+            "use_ytdlp_audio_conversion": self.settings["use_ytdlp_audio_conversion"],
         }
 
         self.status_var.set("Running")
