@@ -12,19 +12,29 @@ import sys
 import threading
 import tkinter as tk
 from functools import lru_cache
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Optional
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-APP_VERSION = "2026.08.23.3"
+APP_VERSION = "2026.08.23.4"
+FFMPEG_BUILD_PROFILE = "all-vendors-win-linux-v1"
 AMD_PCI_VENDOR_ID = "0x1002"
+INTEL_PCI_VENDOR_ID = "0x8086"
+NVIDIA_PCI_VENDOR_ID = "0x10de"
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 BINARIES_DIR = os.path.join(SCRIPT_DIR, "binaries")
 FFMPEG_SOURCE_DIR = os.path.join(BINARIES_DIR, "ffmpeg")
 FFMPEG_OUTPUT_DIR = os.path.join(BINARIES_DIR, "ffmpeg-build")
 FFMPEG_OUTPUT_BIN_DIR = os.path.join(FFMPEG_OUTPUT_DIR, "bin")
 YTDLP_SOURCE_DIR = os.path.join(BINARIES_DIR, "yt-dlp")
-AMF_SOURCE_DIR = os.path.join(BINARIES_DIR, "AMF")
+DEPENDENCIES_DIR = os.path.join(BINARIES_DIR, "dependencies")
+AMF_SOURCE_DIR = os.path.join(DEPENDENCIES_DIR, "AMF")
+NV_CODEC_HEADERS_DIR = os.path.join(DEPENDENCIES_DIR, "nv-codec-headers")
+LIBVPL_SOURCE_DIR = os.path.join(DEPENDENCIES_DIR, "libvpl")
+LIBVPL_BUILD_DIR = os.path.join(DEPENDENCIES_DIR, "libvpl-build")
+DEPENDENCY_PREFIX_DIR = os.path.join(DEPENDENCIES_DIR, "local")
+FFMPEG_BUILD_MARKER = os.path.join(FFMPEG_OUTPUT_DIR, ".downloader-build-profile.json")
 ENCODER_BACKENDS = ("AMD", "INTEL", "NVIDIA", "CPU")
 
 DEFAULT_CONFIG = {
@@ -90,6 +100,7 @@ AUDIO_CONTAINERS = ["mp3", "m4a", "wav", "flac", "opus"]
 THUMBNAIL_CONTAINERS = ["jpg", "png", "webp"]
 
 GPU_ENCODER_CANDIDATES = {
+    # Windows mappings. Linux adds VAAPI vendor-specific alternatives at runtime.
     "AMD": {
         "h264": ["h264_amf"],
         "h265": ["hevc_amf"],
@@ -119,6 +130,10 @@ GPU_ENCODER_LABELS = {
     "h264_nvenc": "NVIDIA NVENC H.264",
     "hevc_nvenc": "NVIDIA NVENC HEVC",
     "av1_nvenc": "NVIDIA NVENC AV1",
+    "h264_vaapi": "VAAPI H.264",
+    "hevc_vaapi": "VAAPI HEVC",
+    "vp9_vaapi": "VAAPI VP9",
+    "av1_vaapi": "VAAPI AV1",
 }
 
 # These are intermediate/download remnants that can be removed after a final
@@ -243,6 +258,28 @@ def _ffmpeg_source_checkout_exists() -> bool:
     return os.path.isfile(os.path.join(FFMPEG_SOURCE_DIR, "configure"))
 
 
+def _ffmpeg_build_profile_ready() -> bool:
+    try:
+        with open(FFMPEG_BUILD_MARKER, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return (
+            isinstance(data, dict)
+            and data.get("profile") == FFMPEG_BUILD_PROFILE
+            and data.get("platform") == sys.platform
+        )
+    except Exception:
+        return False
+
+
+def _write_ffmpeg_build_profile() -> None:
+    os.makedirs(FFMPEG_OUTPUT_DIR, exist_ok=True)
+    temporary = FFMPEG_BUILD_MARKER + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump({"profile": FFMPEG_BUILD_PROFILE, "platform": sys.platform}, handle, indent=2)
+        handle.write("\n")
+    os.replace(temporary, FFMPEG_BUILD_MARKER)
+
+
 FFMPEG_SHARED_DLL_PREFIXES = (
     "avcodec-",
     "avdevice-",
@@ -311,17 +348,14 @@ def _verify_ffmpeg_runtime(ffmpeg: str, ffprobe: str) -> tuple[bool, str]:
 
 
 def find_ffmpeg_executable(name: str) -> Optional[str]:
-    """Resolve FFmpeg, preferring the dedicated compiled build output on Windows."""
-    # Preserve the earlier Linux rule: use the system FFmpeg on PATH first.
+    """Resolve FFmpeg, preferring the downloader's dedicated build on every OS."""
+    built = _ffmpeg_built_tool(name)
+    if built:
+        return built
+
     if sys.platform.startswith("linux"):
         path = shutil.which(name)
-        if path:
-            return os.path.abspath(path)
-        return _ffmpeg_built_tool(name)
-
-    source_tool = _ffmpeg_built_tool(name)
-    if source_tool:
-        return source_tool
+        return os.path.abspath(path) if path else None
 
     candidates = [f"{name}.exe", name] if sys.platform == "win32" else [name]
     return find_local_executable(candidates)
@@ -510,6 +544,86 @@ def _find_windows_msys2() -> tuple[Optional[str], Optional[str], Optional[str]]:
 
 
 
+def _git_checkout_ready(path: str, required_relpath: str) -> bool:
+    return os.path.isfile(os.path.join(path, *required_relpath.split("/")))
+
+
+def _prepare_git_dependency(path: str, url: str, required_relpath: str, label: str, log) -> bool:
+    """Clone a build-time dependency once; later runs update it with fast-forward-only Git."""
+    git = shutil.which("git")
+    if _git_checkout_ready(path, required_relpath):
+        if git and os.path.isdir(os.path.join(path, ".git")):
+            code, output = _run_update_command([git, "pull", "--ff-only"], timeout=180, cwd=path)
+            if code == 0:
+                log(f"{label}: source checkout is up to date.")
+            else:
+                log(f"WARNING: {label} could not be updated; using the existing checkout.")
+                if output:
+                    log(output.splitlines()[-1])
+        return True
+
+    if not git:
+        log(f"WARNING: Git is required to fetch {label}.")
+        return False
+    if os.path.exists(path):
+        log(f"WARNING: {path} exists but is not a valid {label} checkout.")
+        return False
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    log(f"Cloning {label} into {path}...")
+    code = _run_streamed_process([git, "clone", "--depth", "1", url, path], log)
+    return code == 0 and _git_checkout_ready(path, required_relpath)
+
+
+def _msys2_package_prefix(msystem: Optional[str]) -> Optional[str]:
+    return {
+        "UCRT64": "mingw-w64-ucrt-x86_64",
+        "MINGW64": "mingw-w64-x86_64",
+        "CLANG64": "mingw-w64-clang-x86_64",
+    }.get(msystem or "")
+
+
+def _prepare_windows_hardware_build_dependencies(
+    bash: str,
+    toolchain_bin: Optional[str],
+    msystem: Optional[str],
+    env: dict[str, str],
+    log,
+) -> None:
+    """Install MSYS2 build-time headers/dispatcher for AMF, NVENC and Intel QSV."""
+    package_prefix = _msys2_package_prefix(msystem)
+    if not package_prefix or not toolchain_bin:
+        log(
+            "WARNING: A recognized MSYS2 MinGW/UCRT64 environment was not detected; "
+            "automatic AMD/NVIDIA/Intel build dependency installation is unavailable."
+        )
+        return
+
+    msys_root = os.path.dirname(os.path.dirname(toolchain_bin))
+    pacman = os.path.join(msys_root, "usr", "bin", "pacman.exe")
+    if not os.path.isfile(pacman):
+        log("WARNING: MSYS2 pacman was not found; using whatever hardware SDK headers are already installed.")
+        return
+
+    packages = [
+        f"{package_prefix}-pkgconf",
+        f"{package_prefix}-amf-headers",
+        f"{package_prefix}-ffnvcodec-headers",
+        f"{package_prefix}-libvpl",
+    ]
+    log("Ensuring FFmpeg GPU build dependencies for AMD, Intel and NVIDIA are installed in MSYS2...")
+    code = _run_streamed_process(
+        [bash, "-lc", "pacman -S --needed --noconfirm " + " ".join(packages)],
+        log,
+        env=env,
+    )
+    if code != 0:
+        log(
+            "WARNING: Some MSYS2 GPU build dependencies could not be installed. "
+            "FFmpeg will still configure with every dependency that is available."
+        )
+
+
 def _windows_ffmpeg_build_workspace(log) -> Optional[str]:
     """Choose a writable build path with no spaces (FFmpeg builds dislike them)."""
     candidates = []
@@ -590,57 +704,10 @@ def _prepare_windows_ffmpeg_workspace(log) -> Optional[str]:
 
 
 def _prepare_windows_amf_headers(workspace: str, log) -> Optional[str]:
-    """Prepare AMD AMF headers so the source build keeps h264/hevc/av1 AMF support."""
-    source_headers = os.path.join(AMF_SOURCE_DIR, "amf", "public", "include")
+    """Compatibility shim: current Windows builds use the MSYS2 AMF header package."""
+    del workspace, log
+    return None
 
-    if not os.path.isfile(os.path.join(source_headers, "core", "Factory.h")):
-        git = shutil.which("git")
-        if not git:
-            log(
-                "WARNING: Git is not available, so AMD AMF headers could not be fetched. "
-                "FFmpeg will still build, but AMF encoders may be unavailable."
-            )
-            return None
-
-        if os.path.exists(AMF_SOURCE_DIR):
-            log(
-                f"WARNING: {AMF_SOURCE_DIR} exists but does not look like a valid AMF checkout; "
-                "skipping automatic AMF header setup."
-            )
-            return None
-
-        log("AMD AMF headers were not found; cloning the official AMF header repository...")
-        code = _run_streamed_process(
-            [
-                git,
-                "clone",
-                "--depth",
-                "1",
-                "https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git",
-                AMF_SOURCE_DIR,
-            ],
-            log,
-        )
-        if code != 0 or not os.path.isfile(os.path.join(source_headers, "core", "Factory.h")):
-            log(
-                "WARNING: AMD AMF headers could not be prepared. "
-                "Continuing with a base FFmpeg build without forced AMF support."
-            )
-            return None
-
-    include_root = os.path.join(workspace, ".downloader-deps", "include")
-    amf_dest = os.path.join(include_root, "AMF")
-    try:
-        if os.path.isdir(amf_dest):
-            shutil.rmtree(amf_dest)
-        os.makedirs(include_root, exist_ok=True)
-        shutil.copytree(source_headers, amf_dest)
-    except OSError as exc:
-        log(f"WARNING: Could not stage AMD AMF headers for FFmpeg: {exc}")
-        return None
-
-    log("AMD AMF headers are staged for the FFmpeg build.")
-    return include_root
 
 def _copy_msys_runtime_dependencies(staged_bin: str, toolchain_bin: Optional[str], log) -> None:
     """Copy non-system MinGW runtime DLL dependencies needed by the staged FFmpeg build."""
@@ -723,13 +790,10 @@ def _build_ffmpeg_windows(log) -> bool:
     if not workspace:
         return False
 
-    amf_include_root = _prepare_windows_amf_headers(workspace, log)
     staged_install = os.path.join(workspace, "_shared_install")
 
     env = os.environ.copy()
     env["FFMPEG_BUILD_WINDOWS"] = workspace
-    if amf_include_root:
-        env["FFMPEG_AMF_INCLUDE_WINDOWS"] = amf_include_root
     env["CHERE_INVOKING"] = "1"
     env["MSYS2_PATH_TYPE"] = "inherit"
     if msystem:
@@ -738,6 +802,8 @@ def _build_ffmpeg_windows(log) -> bool:
         msys_root = os.path.dirname(os.path.dirname(toolchain_bin))
         usr_bin = os.path.join(msys_root, "usr", "bin")
         env["PATH"] = os.pathsep.join([toolchain_bin, usr_bin, env.get("PATH", "")])
+
+    _prepare_windows_hardware_build_dependencies(bash, toolchain_bin, msystem, env, log)
 
     build_script = r"""
 set -o pipefail
@@ -755,11 +821,28 @@ if ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
 fi
 
 EXTRA_FLAGS=()
-if [ -n "${FFMPEG_AMF_INCLUDE_WINDOWS:-}" ]; then
-    AMF_INCLUDE="$(cygpath -u "$FFMPEG_AMF_INCLUDE_WINDOWS" 2>/dev/null || printf '%s' "$FFMPEG_AMF_INCLUDE_WINDOWS")"
-    EXTRA_FLAGS+=(--enable-amf "--extra-cflags=-I$AMF_INCLUDE")
-    echo "AMD AMF support requested using staged headers: $AMF_INCLUDE"
+
+# Windows hardware backends. The MSYS2 packages above provide compile-time
+# headers/dispatcher; the actual GPU drivers remain vendor-provided runtimes.
+if [ -f "${MINGW_PREFIX:-}/include/AMF/core/Factory.h" ]; then
+    EXTRA_FLAGS+=(--enable-amf)
+    echo "AMD AMF build support enabled."
+else
+    echo "WARNING: AMD AMF headers were not found."
 fi
+if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists ffnvcodec; then
+    EXTRA_FLAGS+=(--enable-ffnvcodec --enable-nvenc --enable-nvdec)
+    echo "NVIDIA NVENC/NVDEC build support enabled."
+else
+    echo "WARNING: NVIDIA ffnvcodec headers were not found."
+fi
+if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists vpl; then
+    EXTRA_FLAGS+=(--enable-libvpl)
+    echo "Intel oneVPL/QSV build support enabled."
+else
+    echo "WARNING: Intel oneVPL/libvpl was not found."
+fi
+EXTRA_FLAGS+=(--enable-d3d11va --enable-dxva2)
 
 if ! command -v nasm >/dev/null 2>&1; then
     echo "NASM was not found; compiling with --disable-x86asm so the first build can still complete."
@@ -908,8 +991,150 @@ make install || exit $?
 
     return True
 
+def _prepare_posix_hardware_dependencies(log) -> tuple[Optional[str], Optional[str]]:
+    """Prepare header-only AMD/NVIDIA dependencies under binaries/dependencies/."""
+    os.makedirs(DEPENDENCIES_DIR, exist_ok=True)
+
+    amf_ok = _prepare_git_dependency(
+        AMF_SOURCE_DIR,
+        "https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git",
+        "amf/public/include/core/Factory.h",
+        "AMD AMF headers",
+        log,
+    )
+    nv_ok = _prepare_git_dependency(
+        NV_CODEC_HEADERS_DIR,
+        "https://github.com/FFmpeg/nv-codec-headers.git",
+        "include/ffnvcodec/nvEncodeAPI.h",
+        "NVIDIA nv-codec-headers",
+        log,
+    )
+
+    staged_include = os.path.join(DEPENDENCY_PREFIX_DIR, "include")
+    staged_amf = os.path.join(staged_include, "AMF")
+    if amf_ok:
+        source_headers = os.path.join(AMF_SOURCE_DIR, "amf", "public", "include")
+        try:
+            if os.path.isdir(staged_amf):
+                shutil.rmtree(staged_amf)
+            os.makedirs(staged_include, exist_ok=True)
+            shutil.copytree(source_headers, staged_amf)
+            log("AMD AMF headers staged for the Linux FFmpeg build.")
+        except OSError as exc:
+            log(f"WARNING: Could not stage AMD AMF headers: {exc}")
+            amf_ok = False
+
+    pkgconfig_dir: Optional[str] = None
+    if nv_ok:
+        make = shutil.which("make")
+        if make:
+            os.makedirs(DEPENDENCY_PREFIX_DIR, exist_ok=True)
+            code = _run_streamed_process(
+                [make, "install", f"PREFIX={DEPENDENCY_PREFIX_DIR}"],
+                log,
+                cwd=NV_CODEC_HEADERS_DIR,
+            )
+            if code == 0:
+                for candidate in (
+                    os.path.join(DEPENDENCY_PREFIX_DIR, "lib", "pkgconfig"),
+                    os.path.join(DEPENDENCY_PREFIX_DIR, "lib64", "pkgconfig"),
+                ):
+                    if os.path.isfile(os.path.join(candidate, "ffnvcodec.pc")):
+                        pkgconfig_dir = candidate
+                        break
+                log("NVIDIA nv-codec-headers installed into the local dependency prefix.")
+            else:
+                log("WARNING: nv-codec-headers could not be installed into the local prefix.")
+        else:
+            log("WARNING: GNU make is required to stage nv-codec-headers.")
+
+    return (staged_include if amf_ok else None), pkgconfig_dir
+
+
+def _pkg_config_exists(env: dict[str, str], *packages: str) -> bool:
+    pkg_config = shutil.which("pkg-config") or shutil.which("pkgconf")
+    if not pkg_config:
+        return False
+    try:
+        proc = subprocess.run(
+            [pkg_config, "--exists", *packages],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _find_local_pkgconfig_file(name: str) -> Optional[str]:
+    for libdir in ("lib", "lib64"):
+        directory = os.path.join(DEPENDENCY_PREFIX_DIR, libdir, "pkgconfig")
+        if os.path.isfile(os.path.join(directory, name)):
+            return directory
+    return None
+
+
+def _prepare_posix_libvpl(log) -> tuple[Optional[str], Optional[str]]:
+    """Build Intel's oneVPL dispatcher locally when the distro does not provide libvpl-dev."""
+    cmake = shutil.which("cmake")
+    if not cmake:
+        log("WARNING: CMake is not installed, so a missing Intel oneVPL dispatcher cannot be built locally.")
+        return None, None
+
+    if not _prepare_git_dependency(
+        LIBVPL_SOURCE_DIR,
+        "https://github.com/intel/libvpl.git",
+        "CMakeLists.txt",
+        "Intel oneVPL dispatcher",
+        log,
+    ):
+        return None, None
+
+    try:
+        if os.path.isdir(LIBVPL_BUILD_DIR):
+            shutil.rmtree(LIBVPL_BUILD_DIR)
+        os.makedirs(LIBVPL_BUILD_DIR, exist_ok=True)
+        os.makedirs(DEPENDENCY_PREFIX_DIR, exist_ok=True)
+    except OSError as exc:
+        log(f"WARNING: Could not prepare the local oneVPL build directory: {exc}")
+        return None, None
+
+    configure = [
+        cmake,
+        "-S", LIBVPL_SOURCE_DIR,
+        "-B", LIBVPL_BUILD_DIR,
+        f"-DCMAKE_INSTALL_PREFIX={DEPENDENCY_PREFIX_DIR}",
+        "-DCMAKE_BUILD_TYPE=Release",
+    ]
+    if _run_streamed_process(configure, log) != 0:
+        log("WARNING: Intel oneVPL dispatcher configuration failed.")
+        return None, None
+    if _run_streamed_process([cmake, "--build", LIBVPL_BUILD_DIR, "--parallel", str(os.cpu_count() or 4)], log) != 0:
+        log("WARNING: Intel oneVPL dispatcher build failed.")
+        return None, None
+    if _run_streamed_process([cmake, "--install", LIBVPL_BUILD_DIR], log) != 0:
+        log("WARNING: Intel oneVPL dispatcher installation failed.")
+        return None, None
+
+    pkg_dir = _find_local_pkgconfig_file("vpl.pc")
+    lib_dir = None
+    for candidate in (
+        os.path.join(DEPENDENCY_PREFIX_DIR, "lib"),
+        os.path.join(DEPENDENCY_PREFIX_DIR, "lib64"),
+    ):
+        if os.path.isdir(candidate) and any(name.startswith("libvpl.so") for name in os.listdir(candidate)):
+            lib_dir = candidate
+            break
+    if pkg_dir:
+        log("Intel oneVPL dispatcher built into the local dependency prefix.")
+    return pkg_dir, lib_dir
+
+
 def _build_ffmpeg_posix(log) -> bool:
-    """Build FFmpeg outside the source checkout and install into ffmpeg-build/."""
+    """Build a Linux/POSIX FFmpeg with AMD, Intel and NVIDIA acceleration where available."""
     configure = os.path.join(FFMPEG_SOURCE_DIR, "configure")
     make = shutil.which("make")
     shell = shutil.which("bash") or shutil.which("sh")
@@ -917,45 +1142,112 @@ def _build_ffmpeg_posix(log) -> bool:
         log("ERROR: FFmpeg source exists, but bash/sh and GNU make are required to compile it.")
         return False
 
-    # Linux normally uses system FFmpeg before reaching this function. For other
-    # POSIX systems, keep object files/configuration outside the repository too.
     build_dir = os.path.join(FFMPEG_OUTPUT_DIR, "obj")
     install_dir = os.path.join(FFMPEG_OUTPUT_DIR, "install")
     try:
-        os.makedirs(build_dir, exist_ok=True)
+        if os.path.isdir(build_dir):
+            shutil.rmtree(build_dir)
         if os.path.isdir(install_dir):
             shutil.rmtree(install_dir)
+        os.makedirs(build_dir, exist_ok=True)
         os.makedirs(install_dir, exist_ok=True)
     except OSError as exc:
         log(f"ERROR: Could not prepare separate FFmpeg build directories: {exc}")
         return False
 
-    log(f"FFmpeg source checkout (build input): {FFMPEG_SOURCE_DIR}")
+    amf_include, nv_pkgconfig = _prepare_posix_hardware_dependencies(log)
+    env = os.environ.copy()
+    pkg_paths: list[str] = []
+    if nv_pkgconfig:
+        pkg_paths.append(nv_pkgconfig)
+    existing_pkg_path = env.get("PKG_CONFIG_PATH", "")
+    if pkg_paths:
+        env["PKG_CONFIG_PATH"] = os.pathsep.join(pkg_paths + ([existing_pkg_path] if existing_pkg_path else []))
+
+    local_vpl_lib: Optional[str] = None
+    if not _pkg_config_exists(env, "vpl"):
+        vpl_pkgconfig, local_vpl_lib = _prepare_posix_libvpl(log)
+        if vpl_pkgconfig:
+            pkg_paths.append(vpl_pkgconfig)
+            env["PKG_CONFIG_PATH"] = os.pathsep.join(pkg_paths + ([existing_pkg_path] if existing_pkg_path else []))
+            existing_ld = env.get("LD_LIBRARY_PATH", "")
+            if local_vpl_lib:
+                env["LD_LIBRARY_PATH"] = os.pathsep.join([local_vpl_lib, existing_ld]) if existing_ld else local_vpl_lib
+
+    configure_args = [
+        shell,
+        configure,
+        f"--prefix={install_dir}",
+        "--disable-doc",
+        "--disable-ffplay",
+        "--enable-gpl",
+        "--enable-version3",
+    ]
+
+    extra_cflags: list[str] = []
+    extra_ldflags: list[str] = []
+    if local_vpl_lib:
+        extra_ldflags += [f"-L{local_vpl_lib}", f"-Wl,-rpath,{local_vpl_lib}"]
+
+    if amf_include:
+        configure_args.append("--enable-amf")
+        extra_cflags.append(f"-I{amf_include}")
+        log("Linux AMD AMF encoder build support enabled (runtime still requires AMD AMF drivers).")
+
+    if _pkg_config_exists(env, "ffnvcodec"):
+        configure_args += ["--enable-ffnvcodec", "--enable-nvenc", "--enable-nvdec"]
+        log("Linux NVIDIA NVENC/NVDEC build support enabled.")
+    else:
+        log("WARNING: NVIDIA ffnvcodec headers are unavailable; NVENC/NVDEC will not be compiled.")
+
+    if _pkg_config_exists(env, "vpl"):
+        configure_args.append("--enable-libvpl")
+        log("Linux Intel oneVPL/QSV build support enabled.")
+    elif _pkg_config_exists(env, "libmfx"):
+        configure_args.append("--enable-libmfx")
+        log("Linux Intel Media SDK/QSV build support enabled through libmfx.")
+    else:
+        log("Intel oneVPL/libmfx development files were not found; Intel VAAPI will still be used when available.")
+
+    if _pkg_config_exists(env, "libva", "libva-drm"):
+        configure_args.append("--enable-vaapi")
+        log("Linux VAAPI build support enabled for AMD/Intel GPUs.")
+    else:
+        log(
+            "WARNING: libva + libva-drm development files were not found. "
+            "Install your distro's libva development packages for AMD/Intel VAAPI support."
+        )
+
+    if _pkg_config_exists(env, "vulkan"):
+        configure_args.append("--enable-vulkan")
+
+    for package, flag in (
+        ("x264", "--enable-libx264"),
+        ("x265", "--enable-libx265"),
+        ("vpx", "--enable-libvpx"),
+        ("aom", "--enable-libaom"),
+        ("opus", "--enable-libopus"),
+        ("libmp3lame", "--enable-libmp3lame"),
+    ):
+        if _pkg_config_exists(env, package):
+            configure_args.append(flag)
+
+    if extra_cflags:
+        configure_args.append("--extra-cflags=" + " ".join(extra_cflags))
+    if extra_ldflags:
+        configure_args.append("--extra-ldflags=" + " ".join(extra_ldflags))
+
+    log(f"FFmpeg source checkout (build input only): {FFMPEG_SOURCE_DIR}")
     log(f"FFmpeg object/build directory: {build_dir}")
     log(f"FFmpeg final build output: {FFMPEG_OUTPUT_BIN_DIR}")
 
-    # FFmpeg supports configuring from a separate working directory. Use an
-    # absolute configure path so generated objects never land in the checkout.
-    code = _run_streamed_process(
-        [
-            shell,
-            configure,
-            f"--prefix={install_dir}",
-            "--disable-doc",
-            "--disable-ffplay",
-            "--enable-gpl",
-            "--enable-version3",
-        ],
-        log,
-        cwd=build_dir,
-    )
-    if code != 0:
+    if _run_streamed_process(configure_args, log, cwd=build_dir, env=env) != 0:
         return False
 
     jobs = str(os.cpu_count() or 4)
-    if _run_streamed_process([make, f"-j{jobs}"], log, cwd=build_dir) != 0:
+    if _run_streamed_process([make, f"-j{jobs}"], log, cwd=build_dir, env=env) != 0:
         return False
-    if _run_streamed_process([make, "install"], log, cwd=build_dir) != 0:
+    if _run_streamed_process([make, "install"], log, cwd=build_dir, env=env) != 0:
         return False
 
     installed_bin = os.path.join(install_dir, "bin")
@@ -963,49 +1255,70 @@ def _build_ffmpeg_posix(log) -> bool:
         if os.path.isdir(FFMPEG_OUTPUT_BIN_DIR):
             shutil.rmtree(FFMPEG_OUTPUT_BIN_DIR)
         shutil.copytree(installed_bin, FFMPEG_OUTPUT_BIN_DIR)
+
+        runtime_lib_dir = os.path.join(FFMPEG_OUTPUT_DIR, "lib")
+        if os.path.isdir(runtime_lib_dir):
+            shutil.rmtree(runtime_lib_dir)
+        if local_vpl_lib:
+            os.makedirs(runtime_lib_dir, exist_ok=True)
+            for name in os.listdir(local_vpl_lib):
+                if name.startswith("libvpl.so"):
+                    src = os.path.join(local_vpl_lib, name)
+                    dst = os.path.join(runtime_lib_dir, name)
+                    if os.path.islink(src):
+                        target = os.readlink(src)
+                        os.symlink(target, dst)
+                    elif os.path.isfile(src):
+                        shutil.copy2(src, dst)
+            log(f"Packaged local Intel oneVPL dispatcher into: {runtime_lib_dir}")
     except OSError as exc:
         log(f"ERROR: Could not install FFmpeg into separate build output: {exc}")
+        return False
+
+    ffmpeg = _ffmpeg_built_tool("ffmpeg")
+    ffprobe = _ffmpeg_built_tool("ffprobe")
+    if not ffmpeg or not ffprobe:
+        log("ERROR: Linux FFmpeg build did not produce ffmpeg and ffprobe.")
+        return False
+    runtime_ok, runtime_error = _verify_ffmpeg_runtime(ffmpeg, ffprobe)
+    if not runtime_ok:
+        log(f"ERROR: Linux FFmpeg build could not run: {runtime_error}")
         return False
     return True
 
 
 def ensure_ffmpeg_ready(log) -> bool:
-    """Compile the cloned FFmpeg only when the separate build output is not ready."""
-    if sys.platform.startswith("linux"):
-        system_ffmpeg = shutil.which("ffmpeg")
-        system_ffprobe = shutil.which("ffprobe")
-        if system_ffmpeg and system_ffprobe:
-            log(f"Using system FFmpeg from PATH: {os.path.abspath(system_ffmpeg)}")
-            return True
-
+    """Compile the cloned FFmpeg when needed; otherwise use the completed dedicated build."""
     if _ffmpeg_source_checkout_exists():
         ffmpeg = _ffmpeg_built_tool("ffmpeg")
         ffprobe = _ffmpeg_built_tool("ffprobe")
         dll_ready = _ffmpeg_shared_runtime_ready()
+        profile_ready = _ffmpeg_build_profile_ready()
 
-        if ffmpeg and ffprobe and dll_ready:
+        if ffmpeg and ffprobe and dll_ready and profile_ready:
             runtime_ok, runtime_error = _verify_ffmpeg_runtime(ffmpeg, ffprobe)
             if runtime_ok:
-                log("Separate FFmpeg build output already exists and is complete; skipping compilation.")
+                log("Separate FFmpeg multi-vendor build already exists and is complete; skipping compilation.")
                 log(f"FFmpeg: {ffmpeg}")
                 log(f"FFprobe: {ffprobe}")
-                if sys.platform == "win32":
-                    log(f"FFmpeg runtime DLLs: {len(_ffmpeg_runtime_dlls())} core DLL(s) detected.")
                 return True
             log(f"Existing FFmpeg runtime is incomplete or broken: {runtime_error}")
 
-        if sys.platform == "win32" and ffmpeg and ffprobe and not dll_ready:
-            log("Existing separate FFmpeg build is static-only or missing shared DLLs; rebuilding with DLLs...")
+        if not profile_ready and (ffmpeg or ffprobe):
+            log("FFmpeg build profile changed; rebuilding once for AMD + Intel + NVIDIA and Linux support...")
+        elif sys.platform == "win32" and ffmpeg and ffprobe and not dll_ready:
+            log("Existing Windows FFmpeg build is missing shared DLLs; rebuilding...")
         else:
-            log("Separate FFmpeg build output was not found or is incomplete. Starting first-run compilation...")
+            log("Separate FFmpeg build output was not found or is incomplete. Starting compilation...")
 
-        success = (
-            _build_ffmpeg_windows(log)
-            if sys.platform == "win32"
-            else _build_ffmpeg_posix(log)
-        )
+        success = _build_ffmpeg_windows(log) if sys.platform == "win32" else _build_ffmpeg_posix(log)
         if not success:
             return False
+
+        try:
+            _write_ffmpeg_build_profile()
+        except OSError as exc:
+            log(f"WARNING: FFmpeg was built, but the build-profile marker could not be written: {exc}")
 
         try:
             detect_ffmpeg_features.cache_clear()
@@ -1017,18 +1330,17 @@ def ensure_ffmpeg_ready(log) -> bool:
         if ffmpeg and ffprobe and _ffmpeg_shared_runtime_ready():
             runtime_ok, runtime_error = _verify_ffmpeg_runtime(ffmpeg, ffprobe)
             if runtime_ok:
-                log("FFmpeg shared build finished successfully in the separate build folder.")
+                log("FFmpeg multi-vendor build finished successfully in the separate build folder.")
                 log(f"FFmpeg: {ffmpeg}")
                 log(f"FFprobe: {ffprobe}")
-                if sys.platform == "win32":
-                    log(f"FFmpeg runtime DLLs: {len(_ffmpeg_runtime_dlls())} core DLL(s) detected.")
                 return True
-            log(f"ERROR: FFmpeg was built but its shared runtime cannot start: {runtime_error}")
+            log(f"ERROR: FFmpeg was built but cannot start: {runtime_error}")
             return False
 
-        log("ERROR: FFmpeg build finished, but the separate executable/shared DLL set is incomplete.")
+        log("ERROR: FFmpeg build finished, but the executable/runtime set is incomplete.")
         return False
 
+    # If there is no cloned source checkout, Linux can still use distro FFmpeg.
     ffmpeg = find_ffmpeg_executable("ffmpeg")
     ffprobe = find_ffmpeg_executable("ffprobe")
     if ffmpeg and ffprobe:
@@ -1041,7 +1353,7 @@ def ensure_ffmpeg_ready(log) -> bool:
 
     log(
         f"ERROR: No FFmpeg source checkout was found at {FFMPEG_SOURCE_DIR}, "
-        "and no usable prebuilt FFmpeg installation was found."
+        "and no usable FFmpeg installation was found."
     )
     return False
 
@@ -1283,17 +1595,95 @@ def detect_ffmpeg_features() -> dict:
     return result
 
 
-def _amd_device_init_args() -> list[str]:
-    """Create D3D11 and AMF devices on the first AMD DXGI adapter."""
-    return [
-        "-init_hw_device",
-        f"d3d11va=amd_d3d11:,vendor_id={AMD_PCI_VENDOR_ID}",
-        "-init_hw_device",
-        "amf=amd_amf@amd_d3d11",
-        "-filter_hw_device",
-        "amd_amf",
-    ]
+def gpu_encoder_candidates(video_codec: str, backend: str) -> list[str]:
+    """Return encoder candidates for the selected vendor on the current operating system."""
+    backend = backend.upper()
+    if sys.platform.startswith("linux"):
+        linux = {
+            "AMD": {
+                "h264": ["h264_vaapi", "h264_amf"],
+                "h265": ["hevc_vaapi", "hevc_amf"],
+                "vp9": ["vp9_vaapi"],
+                "av1": ["av1_vaapi", "av1_amf"],
+            },
+            "INTEL": {
+                "h264": ["h264_qsv", "h264_vaapi"],
+                "h265": ["hevc_qsv", "hevc_vaapi"],
+                "vp9": ["vp9_qsv", "vp9_vaapi"],
+                "av1": ["av1_qsv", "av1_vaapi"],
+            },
+            "NVIDIA": GPU_ENCODER_CANDIDATES["NVIDIA"],
+        }
+        return list(linux.get(backend, {}).get(video_codec, []))
+    return list(GPU_ENCODER_CANDIDATES.get(backend, {}).get(video_codec, []))
 
+
+def hardware_supported_codecs(backend: str) -> list[str]:
+    return [codec for codec in VIDEO_CODECS if codec != "copy" and gpu_encoder_candidates(codec, backend)]
+
+
+def _linux_render_node_for_vendor(backend: str) -> Optional[str]:
+    if not sys.platform.startswith("linux"):
+        return None
+    vendor_id = {"AMD": AMD_PCI_VENDOR_ID, "INTEL": INTEL_PCI_VENDOR_ID}.get(backend.upper())
+    if not vendor_id:
+        return None
+    sys_drm = "/sys/class/drm"
+    try:
+        names = sorted(name for name in os.listdir(sys_drm) if re.fullmatch(r"renderD\d+", name))
+    except OSError:
+        return None
+    for name in names:
+        vendor_file = os.path.join(sys_drm, name, "device", "vendor")
+        try:
+            value = Path(vendor_file).read_text(encoding="ascii").strip().lower()
+        except Exception:
+            continue
+        if value == vendor_id.lower():
+            device = os.path.join("/dev/dri", name)
+            if os.path.exists(device):
+                return device
+    return None
+
+
+def _amd_device_init_args() -> list[str]:
+    """Create a vendor-bound AMD device on Windows; Linux normally uses AMD VAAPI."""
+    if sys.platform == "win32":
+        return [
+            "-init_hw_device", f"d3d11va=amd_d3d11:,vendor_id={AMD_PCI_VENDOR_ID}",
+            "-init_hw_device", "amf=amd_amf@amd_d3d11",
+            "-filter_hw_device", "amd_amf",
+        ]
+    return []
+
+
+def _intel_qsv_device_init_args() -> list[str]:
+    if sys.platform == "win32":
+        return [
+            "-init_hw_device", f"d3d11va=intel_d3d11:,vendor_id={INTEL_PCI_VENDOR_ID}",
+            "-init_hw_device", "qsv=intel_qsv@intel_d3d11",
+            "-filter_hw_device", "intel_qsv",
+        ]
+    if sys.platform.startswith("linux"):
+        node = _linux_render_node_for_vendor("INTEL")
+        if node:
+            return [
+                "-init_hw_device", f"vaapi=intel_va:{node}",
+                "-init_hw_device", "qsv=intel_qsv@intel_va",
+                "-filter_hw_device", "intel_qsv",
+            ]
+    return []
+
+
+def _vaapi_device_init_args(backend: str) -> list[str]:
+    node = _linux_render_node_for_vendor(backend)
+    if not node:
+        return []
+    name = "amd_va" if backend.upper() == "AMD" else "intel_va"
+    return [
+        "-init_hw_device", f"vaapi={name}:{node}",
+        "-filter_hw_device", name,
+    ]
 
 
 def _encoder_output_args(encoder: str) -> list[str]:
@@ -1303,87 +1693,97 @@ def _encoder_output_args(encoder: str) -> list[str]:
     return args
 
 
-
 def usable_gpu_encoders(video_codec: str, backend: str) -> list[str]:
-    """Return compiled encoders belonging only to the selected backend."""
     features = detect_ffmpeg_features()
-    return [
-        encoder
-        for encoder in GPU_ENCODER_CANDIDATES.get(backend, {}).get(video_codec, [])
-        if encoder in features["encoders"]
-    ]
+    return [encoder for encoder in gpu_encoder_candidates(video_codec, backend) if encoder in features["encoders"]]
 
 
 def gpu_decode_strategies(
     encoder: str, backend: str, hwaccels: set[str]
 ) -> list[tuple[str, list[str]]]:
-    """Return hardware-decode prefixes for the selected encoder backend only."""
-    if backend == "AMD":
-        strategies: list[tuple[str, list[str]]] = []
-        if "d3d11va" in hwaccels:
-            strategies.append(
-                (
-                    "AMD D3D11VA decode",
-                    [
-                        *_amd_device_init_args(),
-                        "-hwaccel",
-                        "d3d11va",
-                        "-hwaccel_device",
-                        "amd_d3d11",
-                        "-hwaccel_output_format",
-                        "d3d11",
-                        "-extra_hw_frames",
-                        "32",
-                    ],
-                )
-            )
-        if "amf" in hwaccels:
-            strategies.append(
-                (
-                    "native AMD AMF decode",
-                    [
-                        "-hwaccel",
-                        "amf",
-                        "-hwaccel_output_format",
-                        "amf",
-                        "-extra_hw_frames",
-                        "32",
-                    ],
-                )
-            )
-        return strategies
+    """Return hardware-decode prefixes that remain bound to the selected vendor."""
+    backend = backend.upper()
 
-    if backend == "INTEL" and "qsv" in hwaccels:
-        return [
-            (
-                "Intel QSV decode",
+    if sys.platform.startswith("linux") and encoder.endswith("_vaapi") and "vaapi" in hwaccels:
+        node = _linux_render_node_for_vendor(backend)
+        if node:
+            name = "amd_va" if backend == "AMD" else "intel_va"
+            return [(
+                f"{backend} VAAPI decode",
                 [
-                    "-hwaccel",
-                    "qsv",
-                    "-hwaccel_output_format",
-                    "qsv",
-                    "-extra_hw_frames",
-                    "32",
+                    "-init_hw_device", f"vaapi={name}:{node}",
+                    "-filter_hw_device", name,
+                    "-hwaccel", "vaapi",
+                    "-hwaccel_device", name,
+                    "-hwaccel_output_format", "vaapi",
+                    "-extra_hw_frames", "32",
                 ],
-            )
-        ]
+            )]
+        return []
+
+    if backend == "AMD":
+        if sys.platform == "win32" and "d3d11va" in hwaccels:
+            return [(
+                "AMD D3D11VA decode",
+                [
+                    *_amd_device_init_args(),
+                    "-hwaccel", "d3d11va",
+                    "-hwaccel_device", "amd_d3d11",
+                    "-hwaccel_output_format", "d3d11",
+                    "-extra_hw_frames", "32",
+                ],
+            )]
+        # Linux AMF encoding is kept as a CPU-decode fallback because AMF runtime
+        # initialization there is driver/Vulkan dependent; VAAPI is tried first.
+        return []
+
+    if backend == "INTEL" and encoder.endswith("_qsv") and "qsv" in hwaccels:
+        init = _intel_qsv_device_init_args()
+        if init:
+            return [(
+                "Intel QSV decode",
+                [*init, "-hwaccel", "qsv", "-hwaccel_device", "intel_qsv", "-hwaccel_output_format", "qsv", "-extra_hw_frames", "32"],
+            )]
+        return [(
+            "Intel QSV decode",
+            ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv", "-extra_hw_frames", "32"],
+        )]
 
     if backend == "NVIDIA" and "cuda" in hwaccels:
-        return [
-            (
-                "NVIDIA CUDA decode",
-                [
-                    "-hwaccel",
-                    "cuda",
-                    "-hwaccel_output_format",
-                    "cuda",
-                    "-extra_hw_frames",
-                    "32",
-                ],
-            )
-        ]
+        return [(
+            "NVIDIA CUDA decode",
+            ["-hwaccel", "cuda", "-hwaccel_device", "0", "-hwaccel_output_format", "cuda", "-extra_hw_frames", "32"],
+        )]
 
     return []
+
+
+def cpu_decode_gpu_encode_strategies(encoder: str, backend: str) -> list[tuple[str, list[str], Optional[str]]]:
+    """Return CPU-decode + same-vendor GPU-encode attempts."""
+    backend = backend.upper()
+    if encoder.endswith("_vaapi"):
+        init = _vaapi_device_init_args(backend)
+        if not init:
+            return []
+        return [(f"vendor-bound {backend} VAAPI", init, "format=nv12,hwupload")]
+
+    if encoder.endswith("_qsv"):
+        attempts: list[tuple[str, list[str], Optional[str]]] = [("Intel QSV", [], "format=nv12")]
+        init = _intel_qsv_device_init_args()
+        if init:
+            attempts.append(("vendor-bound Intel QSV", init, "format=nv12,hwupload"))
+        return attempts
+
+    if encoder.endswith("_amf"):
+        attempts = [("AMD AMF", [], "format=nv12")]
+        if sys.platform == "win32":
+            attempts.append(("vendor-bound AMD AMF", _amd_device_init_args(), "format=nv12,hwupload"))
+        return attempts
+
+    if encoder.endswith("_nvenc"):
+        return [("NVIDIA NVENC", [], "format=nv12")]
+
+    return [(backend, [], "format=nv12")]
 
 
 def probe_input_video(src: str) -> dict:
@@ -1477,7 +1877,7 @@ class Worker(threading.Thread):
         ffmpeg = features.get("ffmpeg")
         if not ffmpeg:
             if sys.platform.startswith("linux"):
-                self.q.put(("error", "ffmpeg was not found on the Linux system PATH."))
+                self.q.put(("error", "ffmpeg was not found in the dedicated build output or on the Linux system PATH."))
             else:
                 self.q.put(("error", "ffmpeg was not found in binaries/, beside the script, or on PATH."))
             return
@@ -1501,7 +1901,7 @@ class Worker(threading.Thread):
         if backend == "CPU" or selected_codec in ("copy", None):
             return
 
-        mapped = GPU_ENCODER_CANDIDATES.get(backend, {}).get(selected_codec, [])
+        mapped = gpu_encoder_candidates(selected_codec, backend)
         compiled = [encoder for encoder in mapped if encoder in features["encoders"]]
         if compiled:
             labels = [GPU_ENCODER_LABELS.get(item, item) for item in compiled]
@@ -1904,7 +2304,7 @@ class Worker(threading.Thread):
             )
             return self._run_ffmpeg_attempt("CPU decode + CPU encode", cpu_cmd, dst)
 
-        mapped_encoders = GPU_ENCODER_CANDIDATES.get(backend, {}).get(video_codec, [])
+        mapped_encoders = gpu_encoder_candidates(video_codec, backend)
         if not mapped_encoders:
             self.q.put(
                 (
@@ -1951,39 +2351,22 @@ class Worker(threading.Thread):
                 ):
                     return True
 
-            self.q.put(
-                (
-                    "log",
-                    f"Hardware decoding failed or was unavailable; retrying CPU decode "
-                    f"while keeping {label} encoding.",
-                )
-            )
-            direct_cmd = [ffmpeg, "-y", "-nostdin", "-i", src]
-            direct_cmd += self._base_video_output_args(
-                dst=dst,
-                video_args=_encoder_output_args(encoder),
-                audio_args=audio_args,
-                video_codec=video_codec,
-                video_filter="format=nv12",
-            )
-            if self._run_ffmpeg_attempt(
-                f"CPU decode + {backend} encode ({label})", direct_cmd, dst
-            ):
-                return True
-
-            if backend == "AMD":
-                explicit_cmd = [ffmpeg, "-y", "-nostdin", *_amd_device_init_args(), "-i", src]
-                explicit_cmd += self._base_video_output_args(
+            self.q.put((
+                "log",
+                f"Hardware decoding failed or was unavailable; retrying CPU decode "
+                f"while keeping {label} encoding on the selected {backend} backend.",
+            ))
+            for strategy_label, prefix_args, video_filter in cpu_decode_gpu_encode_strategies(encoder, backend):
+                direct_cmd = [ffmpeg, "-y", "-nostdin", *prefix_args, "-i", src]
+                direct_cmd += self._base_video_output_args(
                     dst=dst,
                     video_args=_encoder_output_args(encoder),
                     audio_args=audio_args,
                     video_codec=video_codec,
-                    video_filter="format=nv12,hwupload",
+                    video_filter=video_filter,
                 )
                 if self._run_ffmpeg_attempt(
-                    f"CPU decode + vendor-bound AMD encode ({label})",
-                    explicit_cmd,
-                    dst,
+                    f"CPU decode + {strategy_label} encode ({label})", direct_cmd, dst
                 ):
                     return True
 
@@ -2666,9 +3049,9 @@ class App:
             if (
                 video != "copy"
                 and backend != "CPU"
-                and video not in GPU_ENCODER_CANDIDATES.get(backend, {})
+                and not gpu_encoder_candidates(video, backend)
             ):
-                supported = ", ".join(GPU_ENCODER_CANDIDATES.get(backend, {}).keys())
+                supported = ", ".join(hardware_supported_codecs(backend))
                 return (
                     f"Video codec '{video}' is not supported by the forced {backend} "
                     f"encoder backend. Supported hardware codecs: {supported}. "
