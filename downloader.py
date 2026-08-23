@@ -17,8 +17,8 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Optional
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-APP_VERSION = "2026.08.23.4"
-FFMPEG_BUILD_PROFILE = "all-vendors-win-linux-v1"
+APP_VERSION = "2026.08.23.7"
+FFMPEG_BUILD_PROFILE = "all-vendors-win-linux-v4-path-safe-deps"
 AMD_PCI_VENDOR_ID = "0x1002"
 INTEL_PCI_VENDOR_ID = "0x8086"
 NVIDIA_PCI_VENDOR_ID = "0x10de"
@@ -35,6 +35,7 @@ LIBVPL_SOURCE_DIR = os.path.join(DEPENDENCIES_DIR, "libvpl")
 LIBVPL_BUILD_DIR = os.path.join(DEPENDENCIES_DIR, "libvpl-build")
 DEPENDENCY_PREFIX_DIR = os.path.join(DEPENDENCIES_DIR, "local")
 FFMPEG_BUILD_MARKER = os.path.join(FFMPEG_OUTPUT_DIR, ".downloader-build-profile.json")
+FFMPEG_CONFIGURE_LOG = os.path.join(FFMPEG_OUTPUT_DIR, "configure.log")
 ENCODER_BACKENDS = ("AMD", "INTEL", "NVIDIA", "CPU")
 
 DEFAULT_CONFIG = {
@@ -590,12 +591,12 @@ def _prepare_windows_hardware_build_dependencies(
     env: dict[str, str],
     log,
 ) -> None:
-    """Install MSYS2 build-time headers/dispatcher for AMF, NVENC and Intel QSV."""
+    """Install MSYS2 build-time dependencies for NVIDIA NVENC and Intel QSV."""
     package_prefix = _msys2_package_prefix(msystem)
     if not package_prefix or not toolchain_bin:
         log(
             "WARNING: A recognized MSYS2 MinGW/UCRT64 environment was not detected; "
-            "automatic AMD/NVIDIA/Intel build dependency installation is unavailable."
+            "automatic NVIDIA/Intel MSYS2 build dependency installation is unavailable."
         )
         return
 
@@ -607,11 +608,10 @@ def _prepare_windows_hardware_build_dependencies(
 
     packages = [
         f"{package_prefix}-pkgconf",
-        f"{package_prefix}-amf-headers",
         f"{package_prefix}-ffnvcodec-headers",
         f"{package_prefix}-libvpl",
     ]
-    log("Ensuring FFmpeg GPU build dependencies for AMD, Intel and NVIDIA are installed in MSYS2...")
+    log("Ensuring FFmpeg GPU build dependencies for Intel and NVIDIA are installed in MSYS2...")
     code = _run_streamed_process(
         [bash, "-lc", "pacman -S --needed --noconfirm " + " ".join(packages)],
         log,
@@ -703,10 +703,114 @@ def _prepare_windows_ffmpeg_workspace(log) -> Optional[str]:
 
 
 
+def _parse_amf_header_version(version_header: str) -> Optional[tuple[int, int, int, int]]:
+    """Read AMF_VERSION_* macros from an AMF core/Version.h header."""
+    try:
+        text = Path(version_header).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    values: list[int] = []
+    for macro in (
+        "AMF_VERSION_MAJOR",
+        "AMF_VERSION_MINOR",
+        "AMF_VERSION_RELEASE",
+        "AMF_VERSION_BUILD_NUM",
+    ):
+        match = re.search(rf"^\s*#\s*define\s+{macro}\s+(\d+)", text, re.MULTILINE)
+        if not match:
+            return None
+        values.append(int(match.group(1)))
+    return tuple(values)  # type: ignore[return-value]
+
+
+def _ffmpeg_required_amf_version(configure_path: str) -> Optional[tuple[int, int, int, int]]:
+    """Extract FFmpeg's current minimum AMF SDK version from its configure script."""
+    try:
+        text = Path(configure_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    # Current FFmpeg uses a packed hexadecimal comparison:
+    # major<<48 | minor<<32 | release<<16 | build.
+    match = re.search(
+        r'check_cpp_condition\s+amf\s+"AMF/core/Version\.h"[\s\\]+.*?>=\s*(0x[0-9A-Fa-f]+)',
+        text,
+        re.DOTALL,
+    )
+    if not match:
+        return None
+    packed = int(match.group(1), 16)
+    return (
+        (packed >> 48) & 0xFFFF,
+        (packed >> 32) & 0xFFFF,
+        (packed >> 16) & 0xFFFF,
+        packed & 0xFFFF,
+    )
+
+
+def _format_version(version: Optional[tuple[int, int, int, int]]) -> str:
+    return ".".join(str(part) for part in version) if version else "unknown"
+
+
 def _prepare_windows_amf_headers(workspace: str, log) -> Optional[str]:
-    """Compatibility shim: current Windows builds use the MSYS2 AMF header package."""
-    del workspace, log
-    return None
+    """Fetch current AMD AMF headers and stage them inside the no-space build workspace."""
+    os.makedirs(DEPENDENCIES_DIR, exist_ok=True)
+
+    if not _prepare_git_dependency(
+        AMF_SOURCE_DIR,
+        "https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git",
+        "amf/public/include/core/Version.h",
+        "AMD AMF SDK headers",
+        log,
+    ):
+        log(
+            "WARNING: Current AMD AMF headers could not be prepared. "
+            "FFmpeg will continue without forcing AMF instead of aborting the whole build."
+        )
+        return None
+
+    source_headers = os.path.join(AMF_SOURCE_DIR, "amf", "public", "include")
+    source_version_header = os.path.join(source_headers, "core", "Version.h")
+    found_version = _parse_amf_header_version(source_version_header)
+    required_version = _ffmpeg_required_amf_version(os.path.join(FFMPEG_SOURCE_DIR, "configure"))
+
+    if found_version:
+        log(f"AMD AMF SDK header version: {_format_version(found_version)}")
+    if required_version:
+        log(f"FFmpeg minimum AMF SDK version: {_format_version(required_version)}")
+    if found_version and required_version and found_version < required_version:
+        log(
+            "WARNING: The checked-out AMD AMF headers are older than this FFmpeg checkout requires. "
+            "AMF will be left to FFmpeg autodetection so the other GPU backends can still build."
+        )
+        return None
+
+    # FFmpeg eventually tokenizes --extra-cflags itself.  An absolute include
+    # path such as ".../youtube stuff/..." therefore gets split even if Python
+    # or bash originally passed it as one argument.  Stage the headers inside
+    # the already no-space FFmpeg workspace so the compiler never sees a path
+    # containing spaces.
+    staged_include = os.path.join(workspace, "_downloader_deps", "include")
+    staged_amf = os.path.join(staged_include, "AMF")
+    try:
+        if os.path.isdir(staged_amf):
+            shutil.rmtree(staged_amf)
+        os.makedirs(staged_include, exist_ok=True)
+        # source_headers contains core/, components/, etc.  FFmpeg expects them as
+        # <include-root>/AMF/core/Version.h, so copy that tree under AMF/.
+        shutil.copytree(source_headers, staged_amf)
+    except OSError as exc:
+        log(f"WARNING: Could not stage current AMD AMF headers: {exc}")
+        return None
+
+    staged_header = os.path.join(staged_amf, "core", "Version.h")
+    if not os.path.isfile(staged_header):
+        log("WARNING: Staged AMD AMF Version.h is missing; AMF will not be forced.")
+        return None
+
+    log(f"Staged current AMD AMF headers in no-space FFmpeg workspace: {staged_include}")
+    return staged_include
 
 
 def _copy_msys_runtime_dependencies(staged_bin: str, toolchain_bin: Optional[str], log) -> None:
@@ -777,6 +881,44 @@ def _copy_msys_runtime_dependencies(staged_bin: str, toolchain_bin: Optional[str
         log("Copied MinGW runtime dependency DLL(s): " + ", ".join(sorted(set(copied), key=str.lower)))
 
 
+def _preserve_windows_configure_log(workspace: str, log) -> Optional[str]:
+    """Copy FFmpeg's external-workspace config.log into binaries/ffmpeg-build/."""
+    source = os.path.join(workspace, "ffbuild", "config.log")
+    if not os.path.isfile(source):
+        log(f"WARNING: FFmpeg configure log was not found in the build workspace: {source}")
+        return None
+
+    try:
+        os.makedirs(FFMPEG_OUTPUT_DIR, exist_ok=True)
+        shutil.copy2(source, FFMPEG_CONFIGURE_LOG)
+        log(f"Saved FFmpeg configure log: {FFMPEG_CONFIGURE_LOG}")
+        return FFMPEG_CONFIGURE_LOG
+    except OSError as exc:
+        log(f"WARNING: Could not save FFmpeg configure log: {exc}")
+        return None
+
+
+def _log_configure_failure_tail(path: Optional[str], log, max_lines: int = 80) -> None:
+    """Put the useful tail of config.log directly in the GUI after a configure failure."""
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError as exc:
+        log(f"WARNING: Could not read saved configure log: {exc}")
+        return
+
+    if not lines:
+        return
+    log(f"--- FFmpeg configure.log tail (last {min(max_lines, len(lines))} lines) ---")
+    for line in lines[-max_lines:]:
+        text = line.rstrip()
+        if text:
+            log(f"[configure.log] {text}")
+    log("--- end configure.log tail ---")
+
+
 def _build_ffmpeg_windows(log) -> bool:
     bash, toolchain_bin, msystem = _find_windows_msys2()
     if not bash:
@@ -804,6 +946,9 @@ def _build_ffmpeg_windows(log) -> bool:
         env["PATH"] = os.pathsep.join([toolchain_bin, usr_bin, env.get("PATH", "")])
 
     _prepare_windows_hardware_build_dependencies(bash, toolchain_bin, msystem, env, log)
+    amf_include = _prepare_windows_amf_headers(workspace, log)
+    if amf_include:
+        env["DOWNLOADER_AMF_INCLUDE_WINDOWS"] = amf_include
 
     build_script = r"""
 set -o pipefail
@@ -821,14 +966,37 @@ if ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
 fi
 
 EXTRA_FLAGS=()
+EXTRA_CFLAGS=()
 
-# Windows hardware backends. The MSYS2 packages above provide compile-time
-# headers/dispatcher; the actual GPU drivers remain vendor-provided runtimes.
-if [ -f "${MINGW_PREFIX:-}/include/AMF/core/Factory.h" ]; then
-    EXTRA_FLAGS+=(--enable-amf)
-    echo "AMD AMF build support enabled."
+# Windows hardware backends. NVIDIA/Intel come from MSYS2 packages; AMD uses
+# current upstream AMF headers staged inside the no-space build workspace.
+# AMF is AUTODETECTED by current FFmpeg.  Do not pass --enable-amf here: if a
+# future/header mismatch occurs, explicitly requesting an autodetect library makes
+# FFmpeg abort the entire configure step.  Supplying a valid include root is enough.
+AMF_INCLUDE_WINDOWS="${DOWNLOADER_AMF_INCLUDE_WINDOWS:-}"
+if [ -n "$AMF_INCLUDE_WINDOWS" ]; then
+    AMF_INCLUDE="$(cygpath -u "$AMF_INCLUDE_WINDOWS" 2>/dev/null || printf '%s' "$AMF_INCLUDE_WINDOWS")"
+    AMF_HEADER="$AMF_INCLUDE/AMF/core/Version.h"
+    if [ -f "$AMF_HEADER" ]; then
+        AMF_CC="$(command -v gcc || command -v clang || true)"
+        if [ -n "$AMF_CC" ] && printf '%s\n' \
+            '#include <AMF/core/Version.h>' \
+            'int main(void) { return 0; }' \
+            | "$AMF_CC" -x c -I"$AMF_INCLUDE" -c -o "$BUILDROOT/.downloader-amf-test.o" - >/dev/null 2>&1; then
+            rm -f "$BUILDROOT/.downloader-amf-test.o"
+            EXTRA_CFLAGS+=("-I./_downloader_deps/include")
+            echo "AMD AMF headers compile successfully from: $AMF_INCLUDE"
+            echo "AMD AMF build support supplied to FFmpeg autodetection."
+        else
+            rm -f "$BUILDROOT/.downloader-amf-test.o"
+            echo "WARNING: Current AMD AMF headers exist but this compiler cannot include them."
+            echo "WARNING: Continuing the multi-vendor build without forcing AMF."
+        fi
+    else
+        echo "WARNING: Staged AMD AMF Version.h was not found at $AMF_HEADER."
+    fi
 else
-    echo "WARNING: AMD AMF headers were not found."
+    echo "WARNING: Current AMD AMF headers were not staged; continuing without forcing AMF."
 fi
 if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists ffnvcodec; then
     EXTRA_FLAGS+=(--enable-ffnvcodec --enable-nvenc --enable-nvdec)
@@ -870,15 +1038,31 @@ rm -rf "$INSTALLROOT"
 mkdir -p "$INSTALLROOT"
 
 echo "Configuring FFmpeg with shared DLL libraries enabled..."
-bash ./configure \
-    --prefix="$INSTALLROOT" \
-    --disable-doc \
-    --disable-ffplay \
-    --enable-gpl \
-    --enable-version3 \
-    --enable-shared \
-    --disable-static \
-    "${EXTRA_FLAGS[@]}" || exit $?
+CONFIGURE_ARGS=(
+    --prefix="$INSTALLROOT"
+    --disable-doc
+    --disable-ffplay
+    --enable-gpl
+    --enable-version3
+    --enable-shared
+    --disable-static
+)
+if [ "${#EXTRA_CFLAGS[@]}" -gt 0 ]; then
+    CONFIGURE_ARGS+=("--extra-cflags=${EXTRA_CFLAGS[*]}")
+fi
+CONFIGURE_ARGS+=("${EXTRA_FLAGS[@]}")
+
+echo "FFmpeg configure extra C flags: ${EXTRA_CFLAGS[*]:-(none)}"
+echo "FFmpeg configure hardware flags: ${EXTRA_FLAGS[*]:-(autodetect only)}"
+bash ./configure "${CONFIGURE_ARGS[@]}"
+CONFIGURE_STATUS=$?
+if [ "$CONFIGURE_STATUS" -ne 0 ]; then
+    echo "ERROR: FFmpeg configure failed with code $CONFIGURE_STATUS."
+    if [ -f ffbuild/config.log ]; then
+        echo "Configure log in build workspace: $BUILDROOT/ffbuild/config.log"
+    fi
+    exit "$CONFIGURE_STATUS"
+fi
 
 JOBS="${NUMBER_OF_PROCESSORS:-4}"
 echo "Compiling FFmpeg shared build with $JOBS parallel job(s)..."
@@ -895,7 +1079,10 @@ make install || exit $?
     if msystem:
         log(f"MSYS2 environment: {msystem}")
 
-    if _run_streamed_process([bash, "-lc", build_script], log, env=env) != 0:
+    build_code = _run_streamed_process([bash, "-lc", build_script], log, env=env)
+    saved_config_log = _preserve_windows_configure_log(workspace, log)
+    if build_code != 0:
+        _log_configure_failure_tail(saved_config_log, log)
         return False
 
     staged_bin = os.path.join(staged_install, "bin")
@@ -1190,9 +1377,24 @@ def _build_ffmpeg_posix(log) -> bool:
         extra_ldflags += [f"-L{local_vpl_lib}", f"-Wl,-rpath,{local_vpl_lib}"]
 
     if amf_include:
-        configure_args.append("--enable-amf")
-        extra_cflags.append(f"-I{amf_include}")
-        log("Linux AMD AMF encoder build support enabled (runtime still requires AMD AMF drivers).")
+        # FFmpeg tokenizes --extra-cflags internally, so an absolute path with
+        # spaces can be split into multiple compiler arguments.  Copy AMF into
+        # the build tree and use a relative include path instead.  This is safe
+        # regardless of where the downloader/source repository is stored.
+        build_local_include = os.path.join(build_dir, "_downloader_deps", "include")
+        build_local_amf = os.path.join(build_local_include, "AMF")
+        try:
+            if os.path.isdir(build_local_amf):
+                shutil.rmtree(build_local_amf)
+            os.makedirs(build_local_include, exist_ok=True)
+            shutil.copytree(os.path.join(amf_include, "AMF"), build_local_amf)
+            extra_cflags.append("-I./_downloader_deps/include")
+            log(
+                "Linux AMD AMF headers staged inside the FFmpeg build tree for path-safe "
+                "autodetection (runtime still requires AMD AMF drivers)."
+            )
+        except OSError as exc:
+            log(f"WARNING: Could not stage Linux AMF headers into the build tree: {exc}")
 
     if _pkg_config_exists(env, "ffnvcodec"):
         configure_args += ["--enable-ffnvcodec", "--enable-nvenc", "--enable-nvdec"]
