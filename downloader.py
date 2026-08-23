@@ -16,9 +16,15 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Optional
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-APP_VERSION = "2026.08.15.1"
+APP_VERSION = "2026.08.23.3"
 AMD_PCI_VENDOR_ID = "0x1002"
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+BINARIES_DIR = os.path.join(SCRIPT_DIR, "binaries")
+FFMPEG_SOURCE_DIR = os.path.join(BINARIES_DIR, "ffmpeg")
+FFMPEG_OUTPUT_DIR = os.path.join(BINARIES_DIR, "ffmpeg-build")
+FFMPEG_OUTPUT_BIN_DIR = os.path.join(FFMPEG_OUTPUT_DIR, "bin")
+YTDLP_SOURCE_DIR = os.path.join(BINARIES_DIR, "yt-dlp")
+AMF_SOURCE_DIR = os.path.join(BINARIES_DIR, "AMF")
 ENCODER_BACKENDS = ("AMD", "INTEL", "NVIDIA", "CPU")
 
 DEFAULT_CONFIG = {
@@ -212,7 +218,7 @@ def find_local_executable(candidates: Iterable[str]) -> Optional[str]:
     """Find an executable in binaries/, beside the script, or on PATH."""
     candidates = list(candidates)
 
-    for directory in (os.path.join(SCRIPT_DIR, "binaries"), SCRIPT_DIR):
+    for directory in (BINARIES_DIR, SCRIPT_DIR):
         for candidate in candidates:
             path = os.path.join(directory, candidate)
             if os.path.isfile(path):
@@ -226,25 +232,113 @@ def find_local_executable(candidates: Iterable[str]) -> Optional[str]:
     return None
 
 
+def _ffmpeg_built_tool(name: str) -> Optional[str]:
+    """Return an FFmpeg tool from the dedicated build output, never the source repo."""
+    executable_name = f"{name}.exe" if sys.platform == "win32" else name
+    path = os.path.join(FFMPEG_OUTPUT_BIN_DIR, executable_name)
+    return os.path.abspath(path) if os.path.isfile(path) else None
+
+
+def _ffmpeg_source_checkout_exists() -> bool:
+    return os.path.isfile(os.path.join(FFMPEG_SOURCE_DIR, "configure"))
+
+
+FFMPEG_SHARED_DLL_PREFIXES = (
+    "avcodec-",
+    "avdevice-",
+    "avfilter-",
+    "avformat-",
+    "avutil-",
+    "swresample-",
+    "swscale-",
+)
+
+
+def _ffmpeg_runtime_dlls() -> list[str]:
+    """Return versioned FFmpeg shared-library DLLs from the dedicated build output."""
+    if sys.platform != "win32" or not os.path.isdir(FFMPEG_OUTPUT_BIN_DIR):
+        return []
+
+    dlls: list[str] = []
+    try:
+        names = os.listdir(FFMPEG_OUTPUT_BIN_DIR)
+    except OSError:
+        return []
+
+    for name in names:
+        lower = name.lower()
+        if not lower.endswith(".dll"):
+            continue
+        if lower.startswith(FFMPEG_SHARED_DLL_PREFIXES):
+            path = os.path.join(FFMPEG_OUTPUT_BIN_DIR, name)
+            if os.path.isfile(path):
+                dlls.append(os.path.abspath(path))
+    return sorted(dlls)
+
+
+def _ffmpeg_shared_runtime_ready() -> bool:
+    """Require all core FFmpeg DLL families on Windows before skipping a build."""
+    if sys.platform != "win32":
+        return True
+
+    present = {
+        next((prefix for prefix in FFMPEG_SHARED_DLL_PREFIXES if os.path.basename(path).lower().startswith(prefix)), None)
+        for path in _ffmpeg_runtime_dlls()
+    }
+    return all(prefix in present for prefix in FFMPEG_SHARED_DLL_PREFIXES)
+
+
+def _verify_ffmpeg_runtime(ffmpeg: str, ffprobe: str) -> tuple[bool, str]:
+    """Actually launch both tools so missing DLL dependencies are caught at startup."""
+    for tool in (ffmpeg, ffprobe):
+        try:
+            proc = subprocess.run(
+                [tool, "-version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except Exception as exc:
+            return False, f"{os.path.basename(tool)} could not start: {exc}"
+        if proc.returncode != 0:
+            output = (proc.stdout or "").strip()
+            if len(output) > 1200:
+                output = output[-1200:]
+            return False, f"{os.path.basename(tool)} runtime check failed ({proc.returncode}): {output}"
+    return True, ""
+
+
 def find_ffmpeg_executable(name: str) -> Optional[str]:
-    """Resolve FFmpeg tools using the platform-specific installation rule."""
+    """Resolve FFmpeg, preferring the dedicated compiled build output on Windows."""
+    # Preserve the earlier Linux rule: use the system FFmpeg on PATH first.
     if sys.platform.startswith("linux"):
         path = shutil.which(name)
-        return os.path.abspath(path) if path else None
+        if path:
+            return os.path.abspath(path)
+        return _ffmpeg_built_tool(name)
+
+    source_tool = _ffmpeg_built_tool(name)
+    if source_tool:
+        return source_tool
 
     candidates = [f"{name}.exe", name] if sys.platform == "win32" else [name]
     return find_local_executable(candidates)
 
 
+def _ytdlp_source_main() -> Optional[str]:
+    path = os.path.join(YTDLP_SOURCE_DIR, "yt_dlp", "__main__.py")
+    return os.path.abspath(path) if os.path.isfile(path) else None
+
+
 def find_ytdlp_executable() -> Optional[str]:
-    """Resolve the bundled yt-dlp executable for the current platform."""
+    """Resolve a prebuilt yt-dlp executable when one is available."""
     if sys.platform.startswith("linux"):
-        path = os.path.join(SCRIPT_DIR, "binaries", "yt-dlp_linux")
+        path = os.path.join(BINARIES_DIR, "yt-dlp_linux")
         if not os.path.isfile(path):
             return None
 
-        # Archive extraction and Windows file copies can remove Linux execute
-        # permissions. Restore the user execute bit when possible.
         if not os.access(path, os.X_OK):
             try:
                 current_mode = os.stat(path).st_mode
@@ -253,6 +347,15 @@ def find_ytdlp_executable() -> Optional[str]:
                 return None
 
         return os.path.abspath(path)
+
+    # Also accept a locally built PyInstaller executable inside the cloned repo.
+    repo_candidates = [
+        os.path.join(YTDLP_SOURCE_DIR, "yt-dlp.exe"),
+        os.path.join(YTDLP_SOURCE_DIR, "dist", "yt-dlp.exe"),
+    ]
+    for path in repo_candidates:
+        if os.path.isfile(path):
+            return os.path.abspath(path)
 
     return find_local_executable(["yt-dlp.exe", "yt-dlp", "yt_dlp.exe", "yt_dlp"])
 
@@ -272,12 +375,16 @@ def command_text(cmd: list[str]) -> str:
 
 
 def get_ytdlp_command() -> Optional[list[str]]:
+    """Use the cloned yt-dlp source directly when it exists."""
+    source_main = _ytdlp_source_main()
+    if source_main:
+        return [sys.executable, source_main]
+
     executable = find_ytdlp_executable()
     if executable:
         return [executable]
 
-    # Linux intentionally requires the bundled binaries/yt-dlp_linux file.
-    # Other platforms retain the Python-module fallback.
+    # Linux keeps its historical bundled-binary/source-checkout rule.
     if sys.platform.startswith("linux"):
         return None
 
@@ -297,10 +404,15 @@ def get_ytdlp_command() -> Optional[list[str]]:
     return None
 
 
-def _run_update_command(cmd: list[str], timeout: int = 180) -> tuple[int, str]:
+def _run_update_command(
+    cmd: list[str],
+    timeout: int = 180,
+    cwd: Optional[str] = None,
+) -> tuple[int, str]:
     try:
         proc = subprocess.run(
             cmd,
+            cwd=cwd,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -316,10 +428,664 @@ def _run_update_command(cmd: list[str], timeout: int = 180) -> tuple[int, str]:
         return -1, str(exc)
 
 
+def _run_streamed_process(
+    cmd: list[str],
+    log,
+    cwd: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
+) -> int:
+    """Run a long build command while forwarding each output line to the GUI."""
+    log(f"Running: {command_text(cmd)}")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        log(f"Could not start build command: {exc}")
+        return -1
+
+    if proc.stdout is not None:
+        for line in iter(proc.stdout.readline, ""):
+            if line == "":
+                break
+            text = line.rstrip()
+            if text:
+                log(f"[ffmpeg-build] {text}")
+
+    proc.wait()
+    return int(proc.returncode or 0)
+
+
+def _find_windows_msys2() -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return (bash.exe, toolchain bin directory, MSYSTEM) for an MSYS2 install."""
+    roots: list[str] = []
+    for value in (
+        os.environ.get("MSYS2_ROOT"),
+        r"C:\msys64",
+        r"C:\tools\msys64",
+        r"C:\msys32",
+    ):
+        if value and value not in roots:
+            roots.append(value)
+
+    path_bash = shutil.which("bash")
+    if path_bash:
+        normalized = os.path.normpath(path_bash)
+        # Typical MSYS2 bash path is <root>\usr\bin\bash.exe.
+        root_guess = os.path.dirname(os.path.dirname(os.path.dirname(normalized)))
+        if os.path.isfile(os.path.join(root_guess, "usr", "bin", "bash.exe")):
+            roots.insert(0, root_guess)
+
+    toolchains = (
+        ("ucrt64", "UCRT64", ("gcc.exe", "clang.exe")),
+        ("mingw64", "MINGW64", ("gcc.exe", "clang.exe")),
+        ("clang64", "CLANG64", ("clang.exe", "gcc.exe")),
+    )
+
+    for root in roots:
+        bash = os.path.join(root, "usr", "bin", "bash.exe")
+        if not os.path.isfile(bash):
+            continue
+        for subdir, msystem, compiler_names in toolchains:
+            toolchain_bin = os.path.join(root, subdir, "bin")
+            if any(os.path.isfile(os.path.join(toolchain_bin, item)) for item in compiler_names):
+                return os.path.abspath(bash), os.path.abspath(toolchain_bin), msystem
+
+    # Last chance: a shell already configured by the user. The preflight inside
+    # the build command will reject Git Bash if no compiler/make is available.
+    if path_bash:
+        return os.path.abspath(path_bash), None, None
+
+    return None, None, None
+
+
+
+
+def _windows_ffmpeg_build_workspace(log) -> Optional[str]:
+    """Choose a writable build path with no spaces (FFmpeg builds dislike them)."""
+    candidates = []
+    for base in (
+        os.environ.get("LOCALAPPDATA"),
+        os.environ.get("TEMP"),
+        os.environ.get("PUBLIC"),
+        r"C:\Users\Public",
+    ):
+        if not base:
+            continue
+        candidate = os.path.abspath(os.path.join(base, "DownloaderFFmpegBuild"))
+        if " " in candidate:
+            continue
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        try:
+            os.makedirs(os.path.dirname(candidate), exist_ok=True)
+            return candidate
+        except OSError:
+            continue
+
+    log(
+        "ERROR: Could not find a writable Windows build path without spaces. "
+        "Set LOCALAPPDATA, TEMP, or PUBLIC to a writable no-space path and run again."
+    )
+    return None
+
+
+def _prepare_windows_ffmpeg_workspace(log) -> Optional[str]:
+    workspace = _windows_ffmpeg_build_workspace(log)
+    if not workspace:
+        return None
+
+    configure = os.path.join(workspace, "configure")
+    configured = os.path.join(workspace, "ffbuild", "config.mak")
+
+    # Keep a configured partial build so a failed compile can resume next run.
+    # If configure never completed, refresh the workspace from the user's clone.
+    if not os.path.isfile(configured):
+        try:
+            if os.path.isdir(workspace):
+                shutil.rmtree(workspace)
+            elif os.path.exists(workspace):
+                os.remove(workspace)
+
+            log(f"Copying FFmpeg source to no-space build workspace: {workspace}")
+            shutil.copytree(
+                FFMPEG_SOURCE_DIR,
+                workspace,
+                ignore=shutil.ignore_patterns(
+                    ".git",
+                    "*.exe",
+                    "*.o",
+                    "*.a",
+                    "*.d",
+                    "config.h",
+                    "config_components.h",
+                ),
+            )
+
+            # Never inherit a configure result generated in the original path.
+            stale_config = os.path.join(workspace, "ffbuild", "config.mak")
+            if os.path.isfile(stale_config):
+                os.remove(stale_config)
+        except Exception as exc:
+            log(f"ERROR: Could not prepare FFmpeg build workspace: {exc}")
+            return None
+
+    if not os.path.isfile(configure):
+        log(f"ERROR: FFmpeg configure script is missing from build workspace: {workspace}")
+        return None
+
+    return workspace
+
+
+
+def _prepare_windows_amf_headers(workspace: str, log) -> Optional[str]:
+    """Prepare AMD AMF headers so the source build keeps h264/hevc/av1 AMF support."""
+    source_headers = os.path.join(AMF_SOURCE_DIR, "amf", "public", "include")
+
+    if not os.path.isfile(os.path.join(source_headers, "core", "Factory.h")):
+        git = shutil.which("git")
+        if not git:
+            log(
+                "WARNING: Git is not available, so AMD AMF headers could not be fetched. "
+                "FFmpeg will still build, but AMF encoders may be unavailable."
+            )
+            return None
+
+        if os.path.exists(AMF_SOURCE_DIR):
+            log(
+                f"WARNING: {AMF_SOURCE_DIR} exists but does not look like a valid AMF checkout; "
+                "skipping automatic AMF header setup."
+            )
+            return None
+
+        log("AMD AMF headers were not found; cloning the official AMF header repository...")
+        code = _run_streamed_process(
+            [
+                git,
+                "clone",
+                "--depth",
+                "1",
+                "https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git",
+                AMF_SOURCE_DIR,
+            ],
+            log,
+        )
+        if code != 0 or not os.path.isfile(os.path.join(source_headers, "core", "Factory.h")):
+            log(
+                "WARNING: AMD AMF headers could not be prepared. "
+                "Continuing with a base FFmpeg build without forced AMF support."
+            )
+            return None
+
+    include_root = os.path.join(workspace, ".downloader-deps", "include")
+    amf_dest = os.path.join(include_root, "AMF")
+    try:
+        if os.path.isdir(amf_dest):
+            shutil.rmtree(amf_dest)
+        os.makedirs(include_root, exist_ok=True)
+        shutil.copytree(source_headers, amf_dest)
+    except OSError as exc:
+        log(f"WARNING: Could not stage AMD AMF headers for FFmpeg: {exc}")
+        return None
+
+    log("AMD AMF headers are staged for the FFmpeg build.")
+    return include_root
+
+def _copy_msys_runtime_dependencies(staged_bin: str, toolchain_bin: Optional[str], log) -> None:
+    """Copy non-system MinGW runtime DLL dependencies needed by the staged FFmpeg build."""
+    if not toolchain_bin or not os.path.isdir(toolchain_bin):
+        return
+
+    objdump_candidates = [
+        os.path.join(toolchain_bin, "objdump.exe"),
+        shutil.which("objdump"),
+    ]
+    objdump = next((item for item in objdump_candidates if item and os.path.isfile(item)), None)
+    if not objdump:
+        log("WARNING: objdump was not found; external MinGW DLL dependencies could not be auto-collected.")
+        return
+
+    try:
+        queue_paths = [
+            os.path.join(staged_bin, name)
+            for name in os.listdir(staged_bin)
+            if name.lower().endswith((".exe", ".dll"))
+            and os.path.isfile(os.path.join(staged_bin, name))
+        ]
+    except OSError:
+        return
+
+    seen: set[str] = set()
+    copied: list[str] = []
+    while queue_paths:
+        binary = queue_paths.pop(0)
+        key = os.path.normcase(os.path.abspath(binary))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            proc = subprocess.run(
+                [objdump, "-p", binary],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception:
+            continue
+
+        for raw_line in (proc.stdout or "").splitlines():
+            match = re.search(r"DLL Name:\s*(.+?)\s*$", raw_line, re.IGNORECASE)
+            if not match:
+                continue
+            dll_name = match.group(1).strip()
+            if not dll_name.lower().endswith(".dll"):
+                continue
+            staged = os.path.join(staged_bin, dll_name)
+            if os.path.isfile(staged):
+                queue_paths.append(staged)
+                continue
+            source = os.path.join(toolchain_bin, dll_name)
+            if not os.path.isfile(source):
+                continue
+            try:
+                shutil.copy2(source, staged)
+                copied.append(dll_name)
+                queue_paths.append(staged)
+            except OSError as exc:
+                log(f"WARNING: Could not copy runtime dependency {dll_name}: {exc}")
+
+    if copied:
+        log("Copied MinGW runtime dependency DLL(s): " + ", ".join(sorted(set(copied), key=str.lower)))
+
+
+def _build_ffmpeg_windows(log) -> bool:
+    bash, toolchain_bin, msystem = _find_windows_msys2()
+    if not bash:
+        log(
+            "ERROR: FFmpeg source is present, but an MSYS2 build shell was not found. "
+            "Install MSYS2 with make + a MinGW/UCRT64 compiler, then run the downloader again."
+        )
+        return False
+
+    workspace = _prepare_windows_ffmpeg_workspace(log)
+    if not workspace:
+        return False
+
+    amf_include_root = _prepare_windows_amf_headers(workspace, log)
+    staged_install = os.path.join(workspace, "_shared_install")
+
+    env = os.environ.copy()
+    env["FFMPEG_BUILD_WINDOWS"] = workspace
+    if amf_include_root:
+        env["FFMPEG_AMF_INCLUDE_WINDOWS"] = amf_include_root
+    env["CHERE_INVOKING"] = "1"
+    env["MSYS2_PATH_TYPE"] = "inherit"
+    if msystem:
+        env["MSYSTEM"] = msystem
+    if toolchain_bin:
+        msys_root = os.path.dirname(os.path.dirname(toolchain_bin))
+        usr_bin = os.path.join(msys_root, "usr", "bin")
+        env["PATH"] = os.pathsep.join([toolchain_bin, usr_bin, env.get("PATH", "")])
+
+    build_script = r"""
+set -o pipefail
+BUILDROOT="$(cygpath -u "$FFMPEG_BUILD_WINDOWS" 2>/dev/null || printf '%s' "$FFMPEG_BUILD_WINDOWS")"
+INSTALLROOT="$BUILDROOT/_shared_install"
+cd "$BUILDROOT" || exit 90
+
+if ! command -v make >/dev/null 2>&1; then
+    echo "ERROR: GNU make is missing from the MSYS2 environment. Install package: make"
+    exit 91
+fi
+if ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+    echo "ERROR: No MinGW/UCRT64 C compiler was found. Install an MSYS2 MinGW/UCRT64 GCC or Clang toolchain."
+    exit 92
+fi
+
+EXTRA_FLAGS=()
+if [ -n "${FFMPEG_AMF_INCLUDE_WINDOWS:-}" ]; then
+    AMF_INCLUDE="$(cygpath -u "$FFMPEG_AMF_INCLUDE_WINDOWS" 2>/dev/null || printf '%s' "$FFMPEG_AMF_INCLUDE_WINDOWS")"
+    EXTRA_FLAGS+=(--enable-amf "--extra-cflags=-I$AMF_INCLUDE")
+    echo "AMD AMF support requested using staged headers: $AMF_INCLUDE"
+fi
+
+if ! command -v nasm >/dev/null 2>&1; then
+    echo "NASM was not found; compiling with --disable-x86asm so the first build can still complete."
+    EXTRA_FLAGS+=(--disable-x86asm)
+fi
+
+if command -v pkg-config >/dev/null 2>&1; then
+    if pkg-config --exists x264; then EXTRA_FLAGS+=(--enable-libx264); fi
+    if pkg-config --exists x265; then EXTRA_FLAGS+=(--enable-libx265); fi
+    if pkg-config --exists vpx; then EXTRA_FLAGS+=(--enable-libvpx); fi
+    if pkg-config --exists aom; then EXTRA_FLAGS+=(--enable-libaom); fi
+    if pkg-config --exists opus; then EXTRA_FLAGS+=(--enable-libopus); fi
+    if pkg-config --exists libmp3lame; then EXTRA_FLAGS+=(--enable-libmp3lame); fi
+else
+    echo "pkg-config was not found; optional external codec libraries will not be auto-enabled."
+fi
+
+# The old workspace may be configured static-only. A DLL build needs a full
+# clean reconfigure so --enable-shared actually takes effect.
+if [ -f ffbuild/config.mak ]; then
+    echo "Removing the previous static/partial FFmpeg configuration..."
+    make distclean || exit $?
+fi
+rm -rf "$INSTALLROOT"
+mkdir -p "$INSTALLROOT"
+
+echo "Configuring FFmpeg with shared DLL libraries enabled..."
+bash ./configure \
+    --prefix="$INSTALLROOT" \
+    --disable-doc \
+    --disable-ffplay \
+    --enable-gpl \
+    --enable-version3 \
+    --enable-shared \
+    --disable-static \
+    "${EXTRA_FLAGS[@]}" || exit $?
+
+JOBS="${NUMBER_OF_PROCESSORS:-4}"
+echo "Compiling FFmpeg shared build with $JOBS parallel job(s)..."
+make -j"$JOBS" || exit $?
+echo "Installing ffmpeg.exe, ffprobe.exe and FFmpeg DLLs into the staging folder..."
+make install || exit $?
+"""
+
+    log(f"FFmpeg source checkout (read-only build input): {FFMPEG_SOURCE_DIR}")
+    log(f"FFmpeg compile workspace (separate from repository): {workspace}")
+    log(f"FFmpeg final build output: {FFMPEG_OUTPUT_BIN_DIR}")
+    log(f"FFmpeg build shell: {bash}")
+    log("FFmpeg build type: shared DLLs (--enable-shared --disable-static)")
+    if msystem:
+        log(f"MSYS2 environment: {msystem}")
+
+    if _run_streamed_process([bash, "-lc", build_script], log, env=env) != 0:
+        return False
+
+    staged_bin = os.path.join(staged_install, "bin")
+    built_ffmpeg = os.path.join(staged_bin, "ffmpeg.exe")
+    built_ffprobe = os.path.join(staged_bin, "ffprobe.exe")
+    if not (os.path.isfile(built_ffmpeg) and os.path.isfile(built_ffprobe)):
+        log("ERROR: Shared build finished but staged ffmpeg.exe/ffprobe.exe were not produced.")
+        return False
+
+    try:
+        staged_names = os.listdir(staged_bin)
+    except OSError as exc:
+        log(f"ERROR: Could not inspect staged FFmpeg build output: {exc}")
+        return False
+
+    ffmpeg_dlls = [
+        name
+        for name in staged_names
+        if name.lower().endswith(".dll")
+        and name.lower().startswith(FFMPEG_SHARED_DLL_PREFIXES)
+        and os.path.isfile(os.path.join(staged_bin, name))
+    ]
+    present_prefixes = {
+        next((prefix for prefix in FFMPEG_SHARED_DLL_PREFIXES if name.lower().startswith(prefix)), None)
+        for name in ffmpeg_dlls
+    }
+    missing_prefixes = [prefix for prefix in FFMPEG_SHARED_DLL_PREFIXES if prefix not in present_prefixes]
+    if missing_prefixes:
+        log(
+            "ERROR: Shared FFmpeg build did not produce all required DLL families. Missing: "
+            + ", ".join(prefix.rstrip("-") for prefix in missing_prefixes)
+        )
+        return False
+
+    _copy_msys_runtime_dependencies(staged_bin, toolchain_bin, log)
+
+    try:
+        # Runtime output is deliberately separate from binaries\ffmpeg, which remains
+        # a source-only Git checkout. Replace the output bin atomically enough that
+        # stale versioned DLLs from an older FFmpeg build cannot be mixed in.
+        os.makedirs(FFMPEG_OUTPUT_DIR, exist_ok=True)
+        replacement_bin = os.path.join(FFMPEG_OUTPUT_DIR, "bin.new")
+        old_bin = os.path.join(FFMPEG_OUTPUT_DIR, "bin.old")
+        for path in (replacement_bin, old_bin):
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            elif os.path.exists(path):
+                os.remove(path)
+        os.makedirs(replacement_bin, exist_ok=True)
+
+        files_to_copy = ["ffmpeg.exe", "ffprobe.exe"] + [
+            name for name in os.listdir(staged_bin) if name.lower().endswith(".dll")
+        ]
+        copied_dlls: list[str] = []
+        for name in files_to_copy:
+            src = os.path.join(staged_bin, name)
+            if not os.path.isfile(src):
+                continue
+            shutil.copy2(src, os.path.join(replacement_bin, name))
+            if name.lower().endswith(".dll"):
+                copied_dlls.append(name)
+
+        # Verify the freshly copied set before making it the active runtime.
+        candidate_ffmpeg = os.path.join(replacement_bin, "ffmpeg.exe")
+        candidate_ffprobe = os.path.join(replacement_bin, "ffprobe.exe")
+        runtime_ok, runtime_error = _verify_ffmpeg_runtime(candidate_ffmpeg, candidate_ffprobe)
+        if not runtime_ok:
+            log(f"ERROR: Fresh FFmpeg build cannot run from the separate output folder: {runtime_error}")
+            shutil.rmtree(replacement_bin, ignore_errors=True)
+            return False
+
+        if os.path.isdir(FFMPEG_OUTPUT_BIN_DIR):
+            os.replace(FFMPEG_OUTPUT_BIN_DIR, old_bin)
+        os.replace(replacement_bin, FFMPEG_OUTPUT_BIN_DIR)
+        if os.path.isdir(old_bin):
+            shutil.rmtree(old_bin, ignore_errors=True)
+
+        log(f"Installed compiled FFmpeg into separate build folder: {FFMPEG_OUTPUT_BIN_DIR}")
+        log(r"The binaries\ffmpeg repository was not used as an output directory.")
+        log(f"Copied {len(copied_dlls)} runtime DLL(s) beside FFmpeg.")
+        for name in sorted(copied_dlls, key=str.lower):
+            log(f"FFmpeg runtime DLL: {name}")
+    except OSError as exc:
+        log(f"ERROR: Could not install compiled FFmpeg into the separate build folder: {exc}")
+        return False
+
+    installed_ffmpeg = os.path.join(FFMPEG_OUTPUT_BIN_DIR, "ffmpeg.exe")
+    installed_ffprobe = os.path.join(FFMPEG_OUTPUT_BIN_DIR, "ffprobe.exe")
+    runtime_ok, runtime_error = _verify_ffmpeg_runtime(installed_ffmpeg, installed_ffprobe)
+    if not runtime_ok:
+        log(f"ERROR: Compiled FFmpeg cannot run with the copied DLL set: {runtime_error}")
+        return False
+
+    return True
+
+def _build_ffmpeg_posix(log) -> bool:
+    """Build FFmpeg outside the source checkout and install into ffmpeg-build/."""
+    configure = os.path.join(FFMPEG_SOURCE_DIR, "configure")
+    make = shutil.which("make")
+    shell = shutil.which("bash") or shutil.which("sh")
+    if not shell or not make:
+        log("ERROR: FFmpeg source exists, but bash/sh and GNU make are required to compile it.")
+        return False
+
+    # Linux normally uses system FFmpeg before reaching this function. For other
+    # POSIX systems, keep object files/configuration outside the repository too.
+    build_dir = os.path.join(FFMPEG_OUTPUT_DIR, "obj")
+    install_dir = os.path.join(FFMPEG_OUTPUT_DIR, "install")
+    try:
+        os.makedirs(build_dir, exist_ok=True)
+        if os.path.isdir(install_dir):
+            shutil.rmtree(install_dir)
+        os.makedirs(install_dir, exist_ok=True)
+    except OSError as exc:
+        log(f"ERROR: Could not prepare separate FFmpeg build directories: {exc}")
+        return False
+
+    log(f"FFmpeg source checkout (build input): {FFMPEG_SOURCE_DIR}")
+    log(f"FFmpeg object/build directory: {build_dir}")
+    log(f"FFmpeg final build output: {FFMPEG_OUTPUT_BIN_DIR}")
+
+    # FFmpeg supports configuring from a separate working directory. Use an
+    # absolute configure path so generated objects never land in the checkout.
+    code = _run_streamed_process(
+        [
+            shell,
+            configure,
+            f"--prefix={install_dir}",
+            "--disable-doc",
+            "--disable-ffplay",
+            "--enable-gpl",
+            "--enable-version3",
+        ],
+        log,
+        cwd=build_dir,
+    )
+    if code != 0:
+        return False
+
+    jobs = str(os.cpu_count() or 4)
+    if _run_streamed_process([make, f"-j{jobs}"], log, cwd=build_dir) != 0:
+        return False
+    if _run_streamed_process([make, "install"], log, cwd=build_dir) != 0:
+        return False
+
+    installed_bin = os.path.join(install_dir, "bin")
+    try:
+        if os.path.isdir(FFMPEG_OUTPUT_BIN_DIR):
+            shutil.rmtree(FFMPEG_OUTPUT_BIN_DIR)
+        shutil.copytree(installed_bin, FFMPEG_OUTPUT_BIN_DIR)
+    except OSError as exc:
+        log(f"ERROR: Could not install FFmpeg into separate build output: {exc}")
+        return False
+    return True
+
+
+def ensure_ffmpeg_ready(log) -> bool:
+    """Compile the cloned FFmpeg only when the separate build output is not ready."""
+    if sys.platform.startswith("linux"):
+        system_ffmpeg = shutil.which("ffmpeg")
+        system_ffprobe = shutil.which("ffprobe")
+        if system_ffmpeg and system_ffprobe:
+            log(f"Using system FFmpeg from PATH: {os.path.abspath(system_ffmpeg)}")
+            return True
+
+    if _ffmpeg_source_checkout_exists():
+        ffmpeg = _ffmpeg_built_tool("ffmpeg")
+        ffprobe = _ffmpeg_built_tool("ffprobe")
+        dll_ready = _ffmpeg_shared_runtime_ready()
+
+        if ffmpeg and ffprobe and dll_ready:
+            runtime_ok, runtime_error = _verify_ffmpeg_runtime(ffmpeg, ffprobe)
+            if runtime_ok:
+                log("Separate FFmpeg build output already exists and is complete; skipping compilation.")
+                log(f"FFmpeg: {ffmpeg}")
+                log(f"FFprobe: {ffprobe}")
+                if sys.platform == "win32":
+                    log(f"FFmpeg runtime DLLs: {len(_ffmpeg_runtime_dlls())} core DLL(s) detected.")
+                return True
+            log(f"Existing FFmpeg runtime is incomplete or broken: {runtime_error}")
+
+        if sys.platform == "win32" and ffmpeg and ffprobe and not dll_ready:
+            log("Existing separate FFmpeg build is static-only or missing shared DLLs; rebuilding with DLLs...")
+        else:
+            log("Separate FFmpeg build output was not found or is incomplete. Starting first-run compilation...")
+
+        success = (
+            _build_ffmpeg_windows(log)
+            if sys.platform == "win32"
+            else _build_ffmpeg_posix(log)
+        )
+        if not success:
+            return False
+
+        try:
+            detect_ffmpeg_features.cache_clear()
+        except NameError:
+            pass
+
+        ffmpeg = _ffmpeg_built_tool("ffmpeg")
+        ffprobe = _ffmpeg_built_tool("ffprobe")
+        if ffmpeg and ffprobe and _ffmpeg_shared_runtime_ready():
+            runtime_ok, runtime_error = _verify_ffmpeg_runtime(ffmpeg, ffprobe)
+            if runtime_ok:
+                log("FFmpeg shared build finished successfully in the separate build folder.")
+                log(f"FFmpeg: {ffmpeg}")
+                log(f"FFprobe: {ffprobe}")
+                if sys.platform == "win32":
+                    log(f"FFmpeg runtime DLLs: {len(_ffmpeg_runtime_dlls())} core DLL(s) detected.")
+                return True
+            log(f"ERROR: FFmpeg was built but its shared runtime cannot start: {runtime_error}")
+            return False
+
+        log("ERROR: FFmpeg build finished, but the separate executable/shared DLL set is incomplete.")
+        return False
+
+    ffmpeg = find_ffmpeg_executable("ffmpeg")
+    ffprobe = find_ffmpeg_executable("ffprobe")
+    if ffmpeg and ffprobe:
+        runtime_ok, runtime_error = _verify_ffmpeg_runtime(ffmpeg, ffprobe)
+        if runtime_ok:
+            log(f"Using existing FFmpeg installation: {ffmpeg}")
+            return True
+        log(f"ERROR: Existing FFmpeg installation could not start: {runtime_error}")
+        return False
+
+    log(
+        f"ERROR: No FFmpeg source checkout was found at {FFMPEG_SOURCE_DIR}, "
+        "and no usable prebuilt FFmpeg installation was found."
+    )
+    return False
+
+
 def update_ytdlp_installation() -> tuple[bool, list[str]]:
     messages: list[str] = []
-    executable = find_ytdlp_executable()
+    source_main = _ytdlp_source_main()
 
+    if source_main:
+        messages.append(f"Using cloned yt-dlp source checkout: {YTDLP_SOURCE_DIR}")
+        git = shutil.which("git")
+        git_dir = os.path.join(YTDLP_SOURCE_DIR, ".git")
+        if git and os.path.isdir(git_dir):
+            code, output = _run_update_command(
+                [git, "pull", "--ff-only"],
+                timeout=180,
+                cwd=YTDLP_SOURCE_DIR,
+            )
+            messages.append("yt-dlp source update: git pull --ff-only")
+            if output:
+                messages.extend(line for line in output.splitlines() if line.strip())
+            if code != 0:
+                messages.append(
+                    "WARNING: The yt-dlp source checkout could not be updated; "
+                    "the existing checkout will still be tested and used."
+                )
+        elif not git:
+            messages.append(
+                "WARNING: Git was not found on PATH, so the cloned yt-dlp checkout "
+                "could not be updated automatically."
+            )
+
+        verify_code, version_output = _run_update_command(
+            [sys.executable, source_main, "--version"], timeout=30
+        )
+        if version_output:
+            messages.append(f"yt-dlp source version: {version_output.splitlines()[-1]}")
+        if verify_code == 0:
+            return True, messages
+
+        messages.append("ERROR: The cloned yt-dlp source checkout could not be executed.")
+        return False, messages
+
+    executable = find_ytdlp_executable()
     if executable:
         code, output = _run_update_command([executable, "-U"])
         messages.append(f"yt-dlp standalone updater: {executable}")
@@ -339,7 +1105,7 @@ def update_ytdlp_installation() -> tuple[bool, list[str]]:
 
     if sys.platform.startswith("linux"):
         messages.append(
-            "Missing binaries/yt-dlp_linux. Linux does not use the pip or PATH fallback."
+            "Missing binaries/yt-dlp source checkout or binaries/yt-dlp_linux."
         )
         return False, messages
 
@@ -372,8 +1138,6 @@ def update_ytdlp_installation() -> tuple[bool, list[str]]:
     if version_output:
         messages.append(f"Installed yt-dlp version: {version_output.splitlines()[-1]}")
     return verify_code == 0 or get_ytdlp_command() is not None, messages
-
-
 
 
 def parse_ffmpeg_component_names(output: str) -> set[str]:
@@ -1480,7 +2244,8 @@ class App:
         self.worker: Optional[Worker] = None
         self.settings, config_warning = load_config()
         self.settings_window: Optional[tk.Toplevel] = None
-        self.ytdlp_update_in_progress = True
+        self.startup_prepare_in_progress = True
+        self.startup_tools_ready = False
 
         top = ttk.Frame(root, padding=8)
         top.pack(fill="x")
@@ -1560,7 +2325,7 @@ class App:
 
         status_frame = ttk.Frame(root, padding=6)
         status_frame.pack(fill="x")
-        self.status_var = tk.StringVar(value="Updating yt-dlp")
+        self.status_var = tk.StringVar(value="Preparing FFmpeg / yt-dlp")
         ttk.Label(status_frame, textvariable=self.status_var).pack(side="left")
 
         log_frame = ttk.LabelFrame(root, text="Log", padding=6)
@@ -1584,18 +2349,30 @@ class App:
         if config_warning:
             self.log(f"WARNING: {config_warning}")
         self.on_mode_change()
-        self.root.after(100, self._start_ytdlp_update)
+        self.root.after(100, self._start_tool_preparation)
         self.root.after(150, self._process_queue)
 
-    def _start_ytdlp_update(self) -> None:
-        threading.Thread(target=self._startup_update_thread, daemon=True).start()
+    def _start_tool_preparation(self) -> None:
+        threading.Thread(target=self._startup_prepare_thread, daemon=True).start()
 
-    def _startup_update_thread(self) -> None:
-        self.q.put(("log", "Checking for yt-dlp updates at application startup..."))
-        success, messages = update_ytdlp_installation()
-        for message in messages:
+    def _startup_prepare_thread(self) -> None:
+        def startup_log(message: str) -> None:
             self.q.put(("log", message))
-        self.q.put(("ytdlp_update_done", success, get_ytdlp_command() is not None))
+
+        startup_log("Preparing local FFmpeg and yt-dlp tools...")
+        ffmpeg_ready = ensure_ffmpeg_ready(startup_log)
+
+        if ffmpeg_ready:
+            startup_log("Checking the cloned yt-dlp checkout for updates...")
+            ytdlp_success, messages = update_ytdlp_installation()
+            for message in messages:
+                startup_log(message)
+            ytdlp_ready = ytdlp_success and get_ytdlp_command() is not None
+        else:
+            startup_log("Skipping yt-dlp preparation because FFmpeg setup failed.")
+            ytdlp_ready = False
+
+        self.q.put(("startup_tools_done", ffmpeg_ready, ytdlp_ready))
 
     def open_settings(self) -> None:
         if self.settings_window is not None and self.settings_window.winfo_exists():
@@ -1962,12 +2739,26 @@ class App:
             subprocess.Popen(["xdg-open", directory])
 
     def start(self) -> None:
-        if self.ytdlp_update_in_progress:
+        if self.startup_prepare_in_progress:
             messagebox.showinfo(
-                "yt-dlp update",
-                "The startup yt-dlp update is still running.",
+                "Preparing tools",
+                "FFmpeg / yt-dlp startup preparation is still running.",
             )
             return
+
+        if not self.startup_tools_ready:
+            # Re-check in case the user fixed the local toolchain after startup.
+            self.startup_tools_ready = bool(
+                find_ffmpeg_executable("ffmpeg")
+                and find_ffmpeg_executable("ffprobe")
+                and get_ytdlp_command()
+            )
+            if not self.startup_tools_ready:
+                messagebox.showerror(
+                    "Tools not ready",
+                    "FFmpeg or yt-dlp is not ready. Check the startup log, fix the reported toolchain issue, and restart the app.",
+                )
+                return
 
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("Already running", "A download is already running.")
@@ -2007,23 +2798,18 @@ class App:
             messagebox.showerror("Output folder error", str(exc))
             return
 
-        if not find_ffmpeg_executable("ffmpeg"):
-            if sys.platform.startswith("linux"):
-                ffmpeg_message = "Install ffmpeg and make sure it is available on the system PATH."
-            else:
-                ffmpeg_message = "Place ffmpeg.exe in the binaries folder or add ffmpeg to PATH."
-            messagebox.showerror("ffmpeg missing", ffmpeg_message)
+        if not (find_ffmpeg_executable("ffmpeg") and find_ffmpeg_executable("ffprobe")):
+            messagebox.showerror(
+                "ffmpeg missing",
+                "The compiled FFmpeg tools are missing. Restart the app to run first-run compilation and check the build log.",
+            )
             return
 
         if not get_ytdlp_command():
-            if sys.platform.startswith("linux"):
-                ytdlp_message = (
-                    "Place the Linux yt-dlp executable at binaries/yt-dlp_linux "
-                    "beside this script."
-                )
-            else:
-                ytdlp_message = "Install yt-dlp or place yt-dlp.exe in the binaries folder."
-            messagebox.showerror("yt-dlp missing", ytdlp_message)
+            messagebox.showerror(
+                "yt-dlp missing",
+                "The cloned binaries/yt-dlp checkout could not be started. Check the startup log.",
+            )
             return
 
         mode = self.mode_var.get()
@@ -2064,17 +2850,21 @@ class App:
                     self.log(f"Finished. Output folder: {folder}")
                     self.status_var.set("Idle")
                     self.start_btn.configure(state="normal")
-                elif kind == "ytdlp_update_done":
-                    success, available = bool(item[1]), bool(item[2])
-                    self.ytdlp_update_in_progress = False
-                    self.start_btn.configure(state="normal")
-                    self.status_var.set("Idle")
-                    if success:
-                        self.log("yt-dlp startup update finished.")
-                    elif available:
-                        self.log("WARNING: yt-dlp could not be updated, but an existing installation is available.")
+                elif kind == "startup_tools_done":
+                    ffmpeg_ready, ytdlp_ready = bool(item[1]), bool(item[2])
+                    self.startup_prepare_in_progress = False
+                    self.startup_tools_ready = ffmpeg_ready and ytdlp_ready
+                    if self.startup_tools_ready:
+                        self.start_btn.configure(state="normal")
+                        self.status_var.set("Idle")
+                        self.log("Startup tool preparation finished. FFmpeg and yt-dlp are ready.")
                     else:
-                        self.log("ERROR: yt-dlp could not be installed or updated.")
+                        self.start_btn.configure(state="disabled")
+                        self.status_var.set("Tool setup failed")
+                        if not ffmpeg_ready:
+                            self.log("ERROR: FFmpeg first-run setup did not complete successfully.")
+                        if not ytdlp_ready:
+                            self.log("ERROR: yt-dlp source setup did not complete successfully.")
                 else:
                     self.log(f"Unknown queue message: {item}")
         except queue.Empty:
