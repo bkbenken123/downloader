@@ -17,8 +17,8 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Optional
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-APP_VERSION = "2026.08.23.7"
-FFMPEG_BUILD_PROFILE = "all-vendors-win-linux-v4-path-safe-deps"
+APP_VERSION = "2026.08.25.1"
+FFMPEG_BUILD_PROFILE = "all-vendors-win-linux-v5-required-codecs"
 AMD_PCI_VENDOR_ID = "0x1002"
 INTEL_PCI_VENDOR_ID = "0x8086"
 NVIDIA_PCI_VENDOR_ID = "0x10de"
@@ -348,6 +348,34 @@ def _verify_ffmpeg_runtime(ffmpeg: str, ffprobe: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _verify_ffmpeg_required_encoders(ffmpeg: str) -> tuple[bool, str]:
+    """Require encoders that the downloader itself depends on for normal output modes."""
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"could not query FFmpeg encoders: {exc}"
+
+    if proc.returncode != 0:
+        output = (proc.stdout or "").strip()
+        if len(output) > 1200:
+            output = output[-1200:]
+        return False, f"FFmpeg encoder query failed ({proc.returncode}): {output}"
+
+    output = (proc.stdout or "").lower()
+    required = ("libmp3lame",)
+    missing = [name for name in required if not re.search(rf"\b{re.escape(name)}\b", output)]
+    if missing:
+        return False, "missing required encoder(s): " + ", ".join(missing)
+    return True, ""
+
+
 def find_ffmpeg_executable(name: str) -> Optional[str]:
     """Resolve FFmpeg, preferring the downloader's dedicated build on every OS."""
     built = _ffmpeg_built_tool(name)
@@ -607,11 +635,21 @@ def _prepare_windows_hardware_build_dependencies(
         return
 
     packages = [
+        # Build tooling / hardware SDKs.
         f"{package_prefix}-pkgconf",
         f"{package_prefix}-ffnvcodec-headers",
         f"{package_prefix}-libvpl",
+        # External codec libraries used by this downloader's codec/container UI.
+        # In particular, FFmpeg has no built-in MP3 encoder; yt-dlp --audio-format
+        # mp3 requires libmp3lame to be compiled into FFmpeg.
+        f"{package_prefix}-lame",
+        f"{package_prefix}-opus",
+        f"{package_prefix}-libx264",
+        f"{package_prefix}-x265",
+        f"{package_prefix}-libvpx",
+        f"{package_prefix}-aom",
     ]
-    log("Ensuring FFmpeg GPU build dependencies for Intel and NVIDIA are installed in MSYS2...")
+    log("Ensuring FFmpeg hardware and external codec build dependencies are installed in MSYS2...")
     code = _run_streamed_process(
         [bash, "-lc", "pacman -S --needed --noconfirm " + " ".join(packages)],
         log,
@@ -1023,7 +1061,7 @@ if command -v pkg-config >/dev/null 2>&1; then
     if pkg-config --exists vpx; then EXTRA_FLAGS+=(--enable-libvpx); fi
     if pkg-config --exists aom; then EXTRA_FLAGS+=(--enable-libaom); fi
     if pkg-config --exists opus; then EXTRA_FLAGS+=(--enable-libopus); fi
-    if pkg-config --exists libmp3lame; then EXTRA_FLAGS+=(--enable-libmp3lame); fi
+    if pkg-config --exists lame; then EXTRA_FLAGS+=(--enable-libmp3lame); fi
 else
     echo "pkg-config was not found; optional external codec libraries will not be auto-enabled."
 fi
@@ -1429,7 +1467,7 @@ def _build_ffmpeg_posix(log) -> bool:
         ("vpx", "--enable-libvpx"),
         ("aom", "--enable-libaom"),
         ("opus", "--enable-libopus"),
-        ("libmp3lame", "--enable-libmp3lame"),
+        ("lame", "--enable-libmp3lame"),
     ):
         if _pkg_config_exists(env, package):
             configure_args.append(flag)
@@ -1499,12 +1537,16 @@ def ensure_ffmpeg_ready(log) -> bool:
 
         if ffmpeg and ffprobe and dll_ready and profile_ready:
             runtime_ok, runtime_error = _verify_ffmpeg_runtime(ffmpeg, ffprobe)
-            if runtime_ok:
+            encoders_ok, encoders_error = _verify_ffmpeg_required_encoders(ffmpeg)
+            if runtime_ok and encoders_ok:
                 log("Separate FFmpeg multi-vendor build already exists and is complete; skipping compilation.")
                 log(f"FFmpeg: {ffmpeg}")
                 log(f"FFprobe: {ffprobe}")
                 return True
-            log(f"Existing FFmpeg runtime is incomplete or broken: {runtime_error}")
+            if not runtime_ok:
+                log(f"Existing FFmpeg runtime is incomplete or broken: {runtime_error}")
+            if not encoders_ok:
+                log(f"Existing FFmpeg build is missing a required codec: {encoders_error}")
 
         if not profile_ready and (ffmpeg or ffprobe):
             log("FFmpeg build profile changed; rebuilding once for AMD + Intel + NVIDIA and Linux support...")
@@ -1518,11 +1560,6 @@ def ensure_ffmpeg_ready(log) -> bool:
             return False
 
         try:
-            _write_ffmpeg_build_profile()
-        except OSError as exc:
-            log(f"WARNING: FFmpeg was built, but the build-profile marker could not be written: {exc}")
-
-        try:
             detect_ffmpeg_features.cache_clear()
         except NameError:
             pass
@@ -1531,12 +1568,21 @@ def ensure_ffmpeg_ready(log) -> bool:
         ffprobe = _ffmpeg_built_tool("ffprobe")
         if ffmpeg and ffprobe and _ffmpeg_shared_runtime_ready():
             runtime_ok, runtime_error = _verify_ffmpeg_runtime(ffmpeg, ffprobe)
-            if runtime_ok:
+            encoders_ok, encoders_error = _verify_ffmpeg_required_encoders(ffmpeg)
+            if runtime_ok and encoders_ok:
+                try:
+                    _write_ffmpeg_build_profile()
+                except OSError as exc:
+                    log(f"WARNING: FFmpeg was built, but the build-profile marker could not be written: {exc}")
                 log("FFmpeg multi-vendor build finished successfully in the separate build folder.")
+                log("Required FFmpeg audio encoder available: libmp3lame")
                 log(f"FFmpeg: {ffmpeg}")
                 log(f"FFprobe: {ffprobe}")
                 return True
-            log(f"ERROR: FFmpeg was built but cannot start: {runtime_error}")
+            if not runtime_ok:
+                log(f"ERROR: FFmpeg was built but cannot start: {runtime_error}")
+            if not encoders_ok:
+                log(f"ERROR: FFmpeg was built without a required codec: {encoders_error}")
             return False
 
         log("ERROR: FFmpeg build finished, but the executable/runtime set is incomplete.")
