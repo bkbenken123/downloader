@@ -17,7 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Optional
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-APP_VERSION = "2026.08.25.1"
+APP_VERSION = "2026.08.25.5"
 FFMPEG_BUILD_PROFILE = "all-vendors-win-linux-v5-required-codecs"
 AMD_PCI_VENDOR_ID = "0x1002"
 INTEL_PCI_VENDOR_ID = "0x8086"
@@ -25,6 +25,10 @@ NVIDIA_PCI_VENDOR_ID = "0x10de"
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 BINARIES_DIR = os.path.join(SCRIPT_DIR, "binaries")
 FFMPEG_SOURCE_DIR = os.path.join(BINARIES_DIR, "ffmpeg")
+FFMPEG_GIT_URLS = (
+    "https://git.ffmpeg.org/ffmpeg.git",
+    "https://github.com/FFmpeg/FFmpeg.git",
+)
 FFMPEG_OUTPUT_DIR = os.path.join(BINARIES_DIR, "ffmpeg-build")
 FFMPEG_OUTPUT_BIN_DIR = os.path.join(FFMPEG_OUTPUT_DIR, "bin")
 YTDLP_SOURCE_DIR = os.path.join(BINARIES_DIR, "yt-dlp")
@@ -1527,7 +1531,288 @@ def _build_ffmpeg_posix(log) -> bool:
     return True
 
 
-def ensure_ffmpeg_ready(log) -> bool:
+
+def check_ffmpeg_update_available(log) -> tuple[bool, bool, str]:
+    """Check whether the FFmpeg Git checkout has a newer upstream commit.
+
+    This is intentionally read-only with respect to the checked-out source: it
+    fetches remote metadata but never pulls, checks out, replaces, or rebuilds
+    anything. Returns (success, update_available, summary).
+    """
+    if not _ffmpeg_source_checkout_exists():
+        message = f"FFmpeg source checkout was not found at {FFMPEG_SOURCE_DIR}."
+        log(f"WARNING: {message}")
+        return False, False, message
+
+    git = shutil.which("git")
+    if not git:
+        message = "Git was not found on PATH, so FFmpeg update availability could not be checked."
+        log(f"WARNING: {message}")
+        return False, False, message
+
+    probe_code, probe_output = _run_update_command(
+        [git, "rev-parse", "--is-inside-work-tree"],
+        timeout=30,
+        cwd=FFMPEG_SOURCE_DIR,
+    )
+    is_git_checkout = probe_code == 0 and probe_output.strip().lower().endswith("true")
+    if not is_git_checkout:
+        message = (
+            "FFmpeg update availability cannot be checked yet because binaries/ffmpeg is a plain "
+            "source tree without Git metadata. Use Settings -> Check / Update FFmpeg once to "
+            "convert it to a Git checkout."
+        )
+        log(f"WARNING: {message}")
+        return False, False, message
+
+    head_code, head_output = _run_update_command(
+        [git, "rev-parse", "HEAD"], timeout=30, cwd=FFMPEG_SOURCE_DIR
+    )
+    if head_code != 0 or not head_output.strip():
+        message = "Could not read the current FFmpeg Git revision while checking for updates."
+        log(f"WARNING: {message}")
+        return False, False, message
+    head_revision = head_output.strip().splitlines()[-1]
+
+    log("Checking FFmpeg Git checkout for available updates...")
+    fetch_code, fetch_output = _run_update_command(
+        [git, "fetch", "--quiet", "--prune", "origin"],
+        timeout=300,
+        cwd=FFMPEG_SOURCE_DIR,
+    )
+    if fetch_code != 0:
+        message = "Could not check FFmpeg for updates from origin; the existing source/build are unchanged."
+        log(f"WARNING: {message}")
+        if fetch_output:
+            log(f"[ffmpeg-git] {fetch_output.splitlines()[-1]}")
+        return False, False, message
+
+    upstream_code, upstream_output = _run_update_command(
+        [git, "rev-parse", "@{u}"], timeout=30, cwd=FFMPEG_SOURCE_DIR
+    )
+    if upstream_code != 0 or not upstream_output.strip():
+        # A checkout without an upstream can still normally compare against
+        # origin/<current-branch>.
+        branch_code, branch_output = _run_update_command(
+            [git, "rev-parse", "--abbrev-ref", "HEAD"], timeout=30, cwd=FFMPEG_SOURCE_DIR
+        )
+        branch = branch_output.strip().splitlines()[-1] if branch_code == 0 and branch_output.strip() else ""
+        if branch and branch != "HEAD":
+            upstream_code, upstream_output = _run_update_command(
+                [git, "rev-parse", f"origin/{branch}"], timeout=30, cwd=FFMPEG_SOURCE_DIR
+            )
+
+    if upstream_code != 0 or not upstream_output.strip():
+        message = "FFmpeg remote metadata was fetched, but the upstream revision could not be determined."
+        log(f"WARNING: {message}")
+        return False, False, message
+
+    upstream_revision = upstream_output.strip().splitlines()[-1]
+    if head_revision == upstream_revision:
+        message = f"No FFmpeg update is available. Source is up to date at {head_revision[:12]}."
+        log(message)
+        return True, False, message
+
+    # HEAD differing from upstream can also mean local commits are ahead or the
+    # histories diverged, so use merge-base --is-ancestor to distinguish a real
+    # fast-forward update from those cases.
+    ancestor_code, _ = _run_update_command(
+        [git, "merge-base", "--is-ancestor", head_revision, upstream_revision],
+        timeout=30,
+        cwd=FFMPEG_SOURCE_DIR,
+    )
+    if ancestor_code == 0:
+        message = (
+            f"FFmpeg update is available: {head_revision[:12]} -> {upstream_revision[:12]}. "
+            "Open Settings and click Check / Update FFmpeg to install it."
+        )
+        log(message)
+        return True, True, message
+
+    reverse_ancestor_code, _ = _run_update_command(
+        [git, "merge-base", "--is-ancestor", upstream_revision, head_revision],
+        timeout=30,
+        cwd=FFMPEG_SOURCE_DIR,
+    )
+    if reverse_ancestor_code == 0:
+        message = (
+            f"No FFmpeg update is available from origin; the local checkout is ahead "
+            f"({head_revision[:12]} vs {upstream_revision[:12]})."
+        )
+        log(message)
+        return True, False, message
+
+    message = (
+        "FFmpeg local and upstream Git histories have diverged, so update availability cannot be "
+        "reported as a normal fast-forward update. The manual updater will leave this checkout unchanged."
+    )
+    log(f"WARNING: {message}")
+    return False, False, message
+
+def update_ffmpeg_source_checkout(log) -> tuple[bool, bool, str]:
+    """Check/update FFmpeg source and convert a legacy source snapshot into a Git checkout.
+
+    Returns (success, changed, summary). A successful no-op means a real Git
+    checkout was already current and no rebuild is required.
+    """
+    if not _ffmpeg_source_checkout_exists():
+        message = f"FFmpeg source checkout was not found at {FFMPEG_SOURCE_DIR}."
+        log(f"ERROR: {message}")
+        return False, False, message
+
+    git = shutil.which("git")
+    if not git:
+        message = "Git was not found on PATH, so FFmpeg updates cannot be checked."
+        log(f"ERROR: {message}")
+        return False, False, message
+
+    # Older versions of this downloader could leave binaries/ffmpeg as a plain
+    # source snapshot/copy. Such a directory has valid FFmpeg source files but no
+    # .git metadata, so `git pull` cannot work. Convert it once by cloning the
+    # official FFmpeg repository beside it and atomically swapping the directories.
+    git_probe_code, git_probe_output = _run_update_command(
+        [git, "rev-parse", "--is-inside-work-tree"],
+        timeout=30,
+        cwd=FFMPEG_SOURCE_DIR,
+    )
+    is_git_checkout = git_probe_code == 0 and git_probe_output.strip().lower().endswith("true")
+
+    if not is_git_checkout:
+        log(
+            "FFmpeg source folder is a plain source tree without Git metadata. "
+            "Converting it to a proper FFmpeg Git checkout..."
+        )
+        parent_dir = os.path.dirname(FFMPEG_SOURCE_DIR)
+        staged_dir = os.path.join(parent_dir, "ffmpeg.git-new")
+        backup_dir = os.path.join(parent_dir, "ffmpeg.snapshot-backup")
+
+        try:
+            for stale in (staged_dir, backup_dir):
+                if os.path.isdir(stale):
+                    shutil.rmtree(stale)
+                elif os.path.exists(stale):
+                    os.remove(stale)
+        except OSError as exc:
+            message = f"Could not clear a stale FFmpeg update staging folder: {exc}"
+            log(f"ERROR: {message}")
+            return False, False, message
+
+        cloned = False
+        last_output = ""
+        for repo_url in FFMPEG_GIT_URLS:
+            log(f"Cloning FFmpeg Git source from: {repo_url}")
+            clone_code, clone_output = _run_update_command(
+                [git, "-c", "core.autocrlf=false", "clone", "--depth", "1", repo_url, staged_dir],
+                timeout=900,
+                cwd=parent_dir,
+            )
+            last_output = clone_output
+            if clone_output:
+                for line in clone_output.splitlines():
+                    if line.strip():
+                        log(f"[ffmpeg-git] {line}")
+            if clone_code == 0 and os.path.isfile(os.path.join(staged_dir, "configure")):
+                cloned = True
+                break
+
+            try:
+                if os.path.isdir(staged_dir):
+                    shutil.rmtree(staged_dir)
+                elif os.path.exists(staged_dir):
+                    os.remove(staged_dir)
+            except OSError:
+                pass
+
+        if not cloned:
+            message = "Could not clone the FFmpeg Git repository. The existing source tree and compiled FFmpeg were left unchanged."
+            log(f"ERROR: {message}")
+            if last_output:
+                log(last_output.splitlines()[-1])
+            return False, False, message
+
+        revision_code, revision_output = _run_update_command(
+            [git, "rev-parse", "HEAD"], timeout=30, cwd=staged_dir
+        )
+        new_revision = (
+            revision_output.strip().splitlines()[-1]
+            if revision_code == 0 and revision_output.strip()
+            else "unknown"
+        )
+
+        try:
+            os.replace(FFMPEG_SOURCE_DIR, backup_dir)
+            try:
+                os.replace(staged_dir, FFMPEG_SOURCE_DIR)
+            except Exception:
+                os.replace(backup_dir, FFMPEG_SOURCE_DIR)
+                raise
+        except Exception as exc:
+            try:
+                if os.path.isdir(staged_dir):
+                    shutil.rmtree(staged_dir)
+            except OSError:
+                pass
+            message = f"Could not replace the legacy FFmpeg source tree with the Git checkout: {exc}"
+            log(f"ERROR: {message}")
+            return False, False, message
+
+        try:
+            shutil.rmtree(backup_dir)
+        except OSError as exc:
+            log(f"WARNING: The old FFmpeg source snapshot could not be removed: {backup_dir} ({exc})")
+
+        log(f"FFmpeg source is now a real Git checkout at revision: {new_revision[:12]}")
+        message = "FFmpeg source tree was converted to the latest Git checkout. Rebuilding the compiled FFmpeg output now."
+        log(message)
+        return True, True, message
+
+    before_code, before_output = _run_update_command(
+        [git, "rev-parse", "HEAD"], timeout=30, cwd=FFMPEG_SOURCE_DIR
+    )
+    if before_code != 0 or not before_output.strip():
+        message = "Could not read the current FFmpeg Git revision."
+        log(f"ERROR: {message}")
+        if before_output:
+            log(before_output.splitlines()[-1])
+        return False, False, message
+
+    before_revision = before_output.strip().splitlines()[-1]
+    log(f"Checking FFmpeg Git checkout for updates: {FFMPEG_SOURCE_DIR}")
+    log("FFmpeg source update: git pull --ff-only")
+    pull_code, pull_output = _run_update_command(
+        [git, "pull", "--ff-only"], timeout=300, cwd=FFMPEG_SOURCE_DIR
+    )
+    if pull_output:
+        for line in pull_output.splitlines():
+            if line.strip():
+                log(f"[ffmpeg-git] {line}")
+    if pull_code != 0:
+        message = "FFmpeg Git update failed; the existing source checkout and compiled build were left in place."
+        log(f"ERROR: {message}")
+        return False, False, message
+
+    after_code, after_output = _run_update_command(
+        [git, "rev-parse", "HEAD"], timeout=30, cwd=FFMPEG_SOURCE_DIR
+    )
+    if after_code != 0 or not after_output.strip():
+        message = "FFmpeg was pulled, but the new Git revision could not be read."
+        log(f"ERROR: {message}")
+        return False, False, message
+
+    after_revision = after_output.strip().splitlines()[-1]
+    changed = before_revision != after_revision
+    if not changed:
+        message = f"FFmpeg source is already up to date at {after_revision[:12]}. No rebuild is needed."
+        log(message)
+        return True, False, message
+
+    log(f"FFmpeg source updated: {before_revision[:12]} -> {after_revision[:12]}")
+    message = "FFmpeg source was updated. Rebuilding the compiled FFmpeg output now."
+    log(message)
+    return True, True, message
+
+
+def ensure_ffmpeg_ready(log, force_rebuild: bool = False) -> bool:
     """Compile the cloned FFmpeg when needed; otherwise use the completed dedicated build."""
     if _ffmpeg_source_checkout_exists():
         ffmpeg = _ffmpeg_built_tool("ffmpeg")
@@ -1535,7 +1820,7 @@ def ensure_ffmpeg_ready(log) -> bool:
         dll_ready = _ffmpeg_shared_runtime_ready()
         profile_ready = _ffmpeg_build_profile_ready()
 
-        if ffmpeg and ffprobe and dll_ready and profile_ready:
+        if ffmpeg and ffprobe and dll_ready and profile_ready and not force_rebuild:
             runtime_ok, runtime_error = _verify_ffmpeg_runtime(ffmpeg, ffprobe)
             encoders_ok, encoders_error = _verify_ffmpeg_required_encoders(ffmpeg)
             if runtime_ok and encoders_ok:
@@ -1548,7 +1833,25 @@ def ensure_ffmpeg_ready(log) -> bool:
             if not encoders_ok:
                 log(f"Existing FFmpeg build is missing a required codec: {encoders_error}")
 
-        if not profile_ready and (ffmpeg or ffprobe):
+        if force_rebuild:
+            log("FFmpeg source changed; forcing a fresh rebuild of the separate compiled output...")
+            try:
+                if os.path.isfile(FFMPEG_BUILD_MARKER):
+                    os.remove(FFMPEG_BUILD_MARKER)
+            except OSError as exc:
+                log(f"WARNING: Could not invalidate the FFmpeg build marker: {exc}")
+
+            if sys.platform == "win32":
+                workspace = _windows_ffmpeg_build_workspace(log)
+                if workspace:
+                    try:
+                        if os.path.isdir(workspace):
+                            shutil.rmtree(workspace)
+                            log("Cleared the old Windows FFmpeg compile workspace so the updated Git source is recopied.")
+                    except OSError as exc:
+                        log(f"ERROR: Could not refresh the Windows FFmpeg build workspace: {exc}")
+                        return False
+        elif not profile_ready and (ffmpeg or ffprobe):
             log("FFmpeg build profile changed; rebuilding once for AMD + Intel + NVIDIA and Linux support...")
         elif sys.platform == "win32" and ffmpeg and ffprobe and not dll_ready:
             log("Existing Windows FFmpeg build is missing shared DLLs; rebuilding...")
@@ -2875,6 +3178,9 @@ class App:
         self.worker: Optional[Worker] = None
         self.settings, config_warning = load_config()
         self.settings_window: Optional[tk.Toplevel] = None
+        self.ffmpeg_update_button: Optional[ttk.Button] = None
+        self.ffmpeg_update_status_var: Optional[tk.StringVar] = None
+        self.ffmpeg_update_in_progress = False
         self.startup_prepare_in_progress = True
         self.startup_tools_ready = False
 
@@ -2994,16 +3300,69 @@ class App:
         ffmpeg_ready = ensure_ffmpeg_ready(startup_log)
 
         if ffmpeg_ready:
-            startup_log("Checking the cloned yt-dlp checkout for updates...")
-            ytdlp_success, messages = update_ytdlp_installation()
-            for message in messages:
-                startup_log(message)
-            ytdlp_ready = ytdlp_success and get_ytdlp_command() is not None
-        else:
-            startup_log("Skipping yt-dlp preparation because FFmpeg setup failed.")
-            ytdlp_ready = False
+            # Only report FFmpeg update availability at startup. Do not pull or
+            # rebuild automatically; the Settings button remains the explicit
+            # update action.
+            check_ffmpeg_update_available(startup_log)
+
+        # yt-dlp is independent of the FFmpeg source/build check. Always attempt
+        # its updater at app startup, even if FFmpeg preparation failed.
+        startup_log("Attempting automatic yt-dlp update...")
+        ytdlp_success, messages = update_ytdlp_installation()
+        for message in messages:
+            startup_log(message)
+        ytdlp_ready = ytdlp_success and get_ytdlp_command() is not None
 
         self.q.put(("startup_tools_done", ffmpeg_ready, ytdlp_ready))
+
+    def _start_ffmpeg_update(self) -> None:
+        if self.ffmpeg_update_in_progress:
+            return
+        if self.startup_prepare_in_progress:
+            parent = self.settings_window if self.settings_window is not None else self.root
+            messagebox.showinfo(
+                "FFmpeg update",
+                "Startup tool preparation is still running. Try the FFmpeg update again after it finishes.",
+                parent=parent,
+            )
+            return
+        if self.worker is not None and self.worker.is_alive():
+            parent = self.settings_window if self.settings_window is not None else self.root
+            messagebox.showwarning(
+                "FFmpeg update",
+                "A download/conversion is currently running. Update FFmpeg after it finishes.",
+                parent=parent,
+            )
+            return
+
+        self.ffmpeg_update_in_progress = True
+        if self.ffmpeg_update_button is not None:
+            self.ffmpeg_update_button.configure(state="disabled")
+        if self.ffmpeg_update_status_var is not None:
+            self.ffmpeg_update_status_var.set("Checking for updates...")
+        self.status_var.set("Updating FFmpeg")
+        self.start_btn.configure(state="disabled")
+        self.log("Manual FFmpeg update requested from Settings.")
+        threading.Thread(target=self._ffmpeg_update_thread, daemon=True).start()
+
+    def _ffmpeg_update_thread(self) -> None:
+        def update_log(message: str) -> None:
+            self.q.put(("log", message))
+
+        success, changed, summary = update_ffmpeg_source_checkout(update_log)
+        rebuilt = False
+        if success and changed:
+            rebuilt = ensure_ffmpeg_ready(update_log, force_rebuild=True)
+            if rebuilt:
+                summary = "FFmpeg source was updated and the compiled FFmpeg build was rebuilt successfully."
+            else:
+                summary = (
+                    "FFmpeg source was updated, but the rebuild did not complete successfully. "
+                    "The log contains the build error; the app will retry the rebuild on the next startup."
+                )
+                success = False
+
+        self.q.put(("ffmpeg_update_done", success, changed, rebuilt, summary))
 
     def open_settings(self) -> None:
         if self.settings_window is not None and self.settings_window.winfo_exists():
@@ -3072,14 +3431,32 @@ class App:
 
         ttk.Checkbutton(
             content,
-            text="Use yt-dlp for audio format conversion (--audio-format)",
+            text="Use yt-dlp for format conversion (if supported)",
             variable=ytdlp_audio_var,
         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 14))
+
+        ttk.Separator(content, orient="horizontal").grid(
+            row=4, column=0, columnspan=3, sticky="ew", pady=(2, 12)
+        )
+        ttk.Label(content, text="FFmpeg update:").grid(
+            row=5, column=0, sticky="w", padx=(0, 12), pady=(0, 4)
+        )
+        self.ffmpeg_update_status_var = tk.StringVar(value="")
+        self.ffmpeg_update_button = ttk.Button(
+            content,
+            text="Check / Update FFmpeg",
+            command=self._start_ffmpeg_update,
+            state="disabled" if (self.startup_prepare_in_progress or self.ffmpeg_update_in_progress) else "normal",
+        )
+        self.ffmpeg_update_button.grid(row=5, column=1, sticky="w", pady=(0, 4))
+        ttk.Label(content, textvariable=self.ffmpeg_update_status_var).grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(0, 10)
+        )
 
         content.columnconfigure(1, weight=1)
 
         buttons = ttk.Frame(content)
-        buttons.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        buttons.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(12, 0))
 
         def save_settings() -> None:
             directory = directory_var.get().strip()
@@ -3150,6 +3527,8 @@ class App:
             except tk.TclError:
                 pass
             self.settings_window = None
+            self.ffmpeg_update_button = None
+            self.ffmpeg_update_status_var = None
 
     def log(self, message: str) -> None:
         self.log_text.configure(state="normal")
@@ -3485,6 +3864,8 @@ class App:
                     ffmpeg_ready, ytdlp_ready = bool(item[1]), bool(item[2])
                     self.startup_prepare_in_progress = False
                     self.startup_tools_ready = ffmpeg_ready and ytdlp_ready
+                    if self.ffmpeg_update_button is not None and not self.ffmpeg_update_in_progress:
+                        self.ffmpeg_update_button.configure(state="normal")
                     if self.startup_tools_ready:
                         self.start_btn.configure(state="normal")
                         self.status_var.set("Idle")
@@ -3496,6 +3877,31 @@ class App:
                             self.log("ERROR: FFmpeg first-run setup did not complete successfully.")
                         if not ytdlp_ready:
                             self.log("ERROR: yt-dlp source setup did not complete successfully.")
+                elif kind == "ffmpeg_update_done":
+                    success, changed, rebuilt, summary = bool(item[1]), bool(item[2]), bool(item[3]), str(item[4])
+                    self.ffmpeg_update_in_progress = False
+                    if self.ffmpeg_update_button is not None:
+                        self.ffmpeg_update_button.configure(state="normal")
+                    if self.ffmpeg_update_status_var is not None:
+                        if success and changed and rebuilt:
+                            self.ffmpeg_update_status_var.set("Updated and rebuilt successfully")
+                        elif success and not changed:
+                            self.ffmpeg_update_status_var.set("Already up to date")
+                        else:
+                            self.ffmpeg_update_status_var.set("Update failed - see log")
+
+                    worker_running = self.worker is not None and self.worker.is_alive()
+                    if self.startup_tools_ready and not worker_running:
+                        self.start_btn.configure(state="normal")
+                        self.status_var.set("Idle")
+                    elif not worker_running:
+                        self.status_var.set("Tool setup failed")
+
+                    parent = self.settings_window if self.settings_window is not None else self.root
+                    if success:
+                        messagebox.showinfo("FFmpeg update", summary, parent=parent)
+                    else:
+                        messagebox.showerror("FFmpeg update", summary, parent=parent)
                 else:
                     self.log(f"Unknown queue message: {item}")
         except queue.Empty:
