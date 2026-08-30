@@ -72,7 +72,6 @@ AUDIO_CODECS = [
     "flac",
     "lpcm",
     "mpeg-1",
-    "mpeg-2",
     "copy",
 ]
 
@@ -2549,8 +2548,11 @@ class Worker(threading.Thread):
             cmd += ["--skip-download", "--write-thumbnail"]
         elif mode == "audio":
             cmd += ["-f", "bestaudio/best"]
-            if self.opts.get("use_ytdlp_audio_conversion", True):
-                audio_format = str(self.opts.get("container") or "best").lower()
+            audio_format = str(self.opts.get("container") or "best").lower()
+            if (
+                self.opts.get("use_ytdlp_audio_conversion", True)
+                and audio_format == "mp3"
+            ):
                 cmd += ["-x", "--audio-format", audio_format]
 
                 # Explicitly point yt-dlp at the same FFmpeg installation used
@@ -3083,7 +3085,9 @@ class Worker(threading.Thread):
         candidates.sort(key=lambda path: os.path.getmtime(path))
 
         use_ytdlp_audio = (
-            mode == "audio" and self.opts.get("use_ytdlp_audio_conversion", True)
+            mode == "audio"
+            and self.opts.get("use_ytdlp_audio_conversion", True)
+            and str(self.opts.get("container") or "").lower().lstrip(".") == "mp3"
         )
         if use_ytdlp_audio:
             target_extension = "." + str(self.opts["container"]).lower().lstrip(".")
@@ -3564,6 +3568,27 @@ class App:
             return list(AUDIO_CODECS)
         return []
 
+    def _ytdlp_supports_audio_container(self, container: str) -> bool:
+        """Return whether yt-dlp should own conversion for this output format.
+
+        In this UI, yt-dlp conversion is intentionally limited to MP3. Other
+        audio formats are handled by the normal FFmpeg codec/container path so
+        the user can choose the appropriate codec.
+        """
+        return container.lower().lstrip(".") == "mp3"
+
+    def _update_audio_codec_state(self) -> None:
+        """Disable codec selection only when yt-dlp owns the selected format."""
+        if self.mode_var.get() != "audio":
+            return
+
+        use_ytdlp = self.settings.get("use_ytdlp_audio_conversion", True)
+        container = self.container_var.get().lower().lstrip(".")
+        ytdlp_handles_format = use_ytdlp and self._ytdlp_supports_audio_container(container)
+        self.audio_codec_dd.configure(
+            state="disabled" if ytdlp_handles_format else "normal"
+        )
+
     def on_mode_change(self) -> None:
         mode = self.mode_var.get()
 
@@ -3590,13 +3615,7 @@ class App:
             if self.container_var.get() not in containers:
                 self.container_var.set("mp3")
             self.video_codec_dd.configure(state="disabled")
-            self.audio_codec_dd.configure(
-                state=(
-                    "disabled"
-                    if self.settings.get("use_ytdlp_audio_conversion", True)
-                    else "normal"
-                )
-            )
+            self.audio_codec_dd.configure(state="normal")
         else:
             containers = list(THUMBNAIL_CONTAINERS)
             self._set_option_menu(
@@ -3634,6 +3653,8 @@ class App:
                 self.audio_codec_var.set("copy")
         else:
             self.audio_codec_var.set("N/A")
+
+        self._update_audio_codec_state()
 
     def _validate_selection(self) -> Optional[str]:
         mode = self.mode_var.get()
@@ -3689,10 +3710,13 @@ class App:
             if container not in AUDIO_CONTAINERS:
                 return f"Unsupported audio container: {container}."
 
-            # When enabled, yt-dlp's ExtractAudio postprocessor owns the audio
-            # format conversion, so the separate FFmpeg audio-codec selector is
-            # intentionally ignored for audio-only downloads.
-            if self.settings.get("use_ytdlp_audio_conversion", True):
+            # yt-dlp only owns conversion for formats it supports in this UI.
+            # For other containers, fall through to the normal FFmpeg codec
+            # validation so the user can select a compatible codec.
+            if (
+                self.settings.get("use_ytdlp_audio_conversion", True)
+                and self._ytdlp_supports_audio_container(container)
+            ):
                 return None
 
             if audio not in AUDIO_CODECS:
